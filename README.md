@@ -182,7 +182,6 @@ Key documentation:
 - [docs/control-plane-security.md](docs/control-plane-security.md) — authenticated `wss://` for remote Nodes/Workers
 - [docs/worker-build-network.md](docs/worker-build-network.md) — mirrors and proxies for restricted networks
 - [docs/production-deployment.md](docs/production-deployment.md) — reverse proxies, public origins
-- [ROADMAP.md](ROADMAP.md) — where the project is heading
 
 ## Configuration notes
 
@@ -191,6 +190,3 @@ Key documentation:
 - Public/reverse-proxied access — `atms start --ui --public --ui-public-url https://atms.example.com`; the Origin must be an exact `http(s)` Origin.
 - Android Live Voice from the bundled WebView is opt-in (`ATMS_ANDROID_LIVE_VOICE_ENABLED=1`) and should only be enabled on a trusted LAN.
 
-## License
-
-MIT. See [LICENSE](LICENSE).

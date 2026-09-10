@@ -2,198 +2,69 @@
 
 [English](README.md) | 中文
 
-Atms 是一个 TypeScript 运行时，用于把一次性的 agent 对话，转化为可审计、可复用的工作流。它的名字就是它做的事：**Home**，它运行在你自己的 homelab、NAS 或家庭服务器上，服务于那里的人；**Rail**，即 DAG 的轨道形态——工作沿着明确的边，在节点之间流动，而不是堆积在一个聊天窗口里。整套设计的出发点很朴素：在一切自动化里，人的注意力都是最稀缺的资源，因此系统应当尽量少地占用它。
+Atms 是一个本地运行的 TypeScript Agent 编排运行时。你把自然语言请求交给 **Manager Agent**（一个能使用工具的 LLM）；它把工作规划成 **DAG**（有向无环图）并全程监督，而 **Worker 容器**负责在真实的 LLM 后端上执行每个节点。每次运行都是隔离的、可追踪、可重放的。
 
-它最终想要成为的样子，是一个常驻于家庭数据中心的 agent——你开口说话，它听懂、去办，再把结果以你一眼就能看懂的形态呈现给你；而在它身后，则是一群按 DAG 编排起来的 agent 在分头工作。今天这个仓库里存放的，是支撑它的地基：一个 DAG 引擎、一个 CLI、一个语音面，以及生成式 UI 迈出的最初几步。
+它运行在你自己的硬件上——笔记本、家用服务器或 NAS——并可以接入你指定的任意模型端点（Anthropic、OpenAI 兼容、本地 vLLM、Codex，或实验性的 DeepSeek harness）。
 
-## 为什么做这件事
+## 为什么用 DAG，而不是一个漫长的对话
 
-人这一端的带宽有限，而我们要完成的事情却往往复杂。Atms 的形态，是一个朝机器一侧不断张开的喇叭口：
+单 Agent 对话是一个黑盒：上下文不断膨胀，工具调用与推理纠缠在一起，某一步失败就得从头再来。Atms 把这种模式翻转过来：
 
-- **语音**——首选的输入方式，因为它对你的占用最少。你说话，它聆听、确认，在做任何事之前先消除模糊地带。文字也始终可用，用于安静的场合、需要精确表达的时候，或单纯还没习惯跟电脑说话的人。
-- **生成式 UI**——agent 不会把原始日志或 JSON 砸到你面前，而是根据当下的情境，生成一份便于阅读的界面。
-- **DAG**——藏在两者背后的执行引擎。多个 agent、多种角色、多个环境，每一次交接都有迹可循，每一次运行都可以重放。
+- **一次规划，多次执行。** Manager Agent 把请求拆解为带有显式交接（handoff）的节点。每个节点拥有独立的上下文窗口，完成自己的部分后把证据传递给下一个节点。
+- **每个节点可以用不同模型。** 智能模型负责规划和评审，便宜快速的模型承担大部分工作。模板通过 per-agent 的 `provider` / `model` 映射来表达这一点。
+- **默认可审计。** 每次运行都在 `${ATMS_HOME}/workspace/<run_id>/` 下保留工作区、执行轨迹、记分卡（scorecard）和评估报告。
+- **可恢复。** 可以在持久化边界处暂停、从检查点恢复指定节点、在运行中注入新指令，或重放整个图。
+- **人或 Agent 都可以驱动。** 可以从浏览器 UI 与之对话（语音或文本）、用 `atms` CLI 操作、或直接让一个 coding agent 驱动 CLI。
 
-聊天这种形式，你看不到里面发生了什么；DAG 是一张你能审视、能重放、能迭代的图。Atms 就位于两者之间——人这一侧窄，机器那一侧宽。
+## 组成
 
-## 今天能做什么
+| 组件 | 包 | 职责 |
+| --- | --- | --- |
+| Manager Agent | `atms_manager` | 基于 LLM 的规划/监督器。把请求转化为 DAG，监督执行，并回答关于运行的问题。 |
+| DAG 运行时 | `atms_manager` | 执行引擎：调度、交接、按运行隔离的工作区、重放、记分卡、评估报告。 |
+| Node | `atms_node` | 通过 Docker 创建 Worker 容器，每个 DAG 节点一个容器，同一次运行共享工作区。 |
+| Worker | `atms_worker` | 执行节点。后端适配器：`claude-sdk`、`codex_appserver`、`kimi_code`、`deepseek_harness`，另有一个用于测试的离线确定性后端。 |
+| Agent UI | `agent-ui` | Vue 3 浏览器界面：与 Manager Agent 聊天、语音座舱（ASR/TTS）、实时 DAG 画布、运行列表、设置、生成式组件。 |
+| CLI | `atms_cli` | `atms` 命令——完整控制面（start、run、supervise、scorecard、replay、model config、plugin、credential……）。 |
+| Protocol | `atms_protocol` | 共享的消息与校验契约——所有组件之间通信的单一事实来源。 |
+| Plugins | `plugins/` | 内置与示例插件（生成式 UI、PR closeout、topic outline、release notes、video cover）。插件是带 schema、fixtures 和 skill 的可安装包。 |
+| Skills | `skills/` | Manager Agent 自动发现的 `SKILL.md` 操作手册（`atms-cli`、`atms-dag-ops`、`atms-dag-patterns`、`atms-pr-review`、`atms-pr-closeout`……）。 |
 
-- **DAG 运行时**（*最成熟*）——多 agent 编排，具备显式的交接、按运行隔离的工作区、运行重放、评分卡以及运行评估。
-- **CLI `atms`**——`start`、`config`、`doctor`、`run`、`smoke`、`dag supervise`、`scorecard`、`eval-run`、`replay`。这是操作 Atms 的主要入口。
-- **语音面**——一份 Voice Surface Contract，包含 ASR / TTS / VAD，默认中文，通过桌面语音壳提供服务。agent 会在真正动手之前，跨多个轮次理清你的意图。
-- **生成式 UI**（*探索中*）——agent 不再倾倒日志或 JSON，而是产出结构化的、为"一眼能看懂"而设计的视图。这套东西的形态仍在通过真实用例摸索，契约与 widget 集合还会继续变化。
-- **Docker Worker**——Manager 和 Node 作为本地服务运行；Node 通过 Docker 拉起 Worker 容器，一个 DAG 节点对应一个容器，同一次运行共享一个工作区。
+## 快速开始
 
-## 把这份 README 交给你的 agent
-
-Atms 有一个设计目标：让它能被 agent 操作的程度，不亚于被人操作。这份 README 的写法，让它同时是一份 agent 可读的 runbook。下面的命令都是纯粹的 `atms` 调用，名字本身即说明用途，每一步也都写明了你会看到什么。你可以把整份文件交给你的 agent（Claude Code、Codex，或任何能执行 shell、读取输出的工具），让它照着 Quickstart，在你的机器上完成 Atms 的安装、配置与验证。
-
-## Quickstart
-
-先准备好这些：
+要求：
 
 - Node.js 20+ 和 npm 10+
-- Docker，Node 用它来拉起 Worker 容器
-- 一个兼容 Claude Agent SDK 的模型 endpoint，用于真实的 agent 运行
+- Docker（Node 用它创建 Worker 容器）
+- 至少一个 LLM 端点——一个模型 API key，或一个本地 OpenAI 兼容服务（vLLM、LM Studio……）
 
-不同平台需要留意的点：
-
-- **macOS**——安装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)。默认的 `host.docker.internal` 映射即可直接使用。
-- **Windows**——Docker Desktop（WSL 2 或 Hyper-V 后端均可），并且请从 Git Bash（或其他 POSIX 兼容的 shell）中运行 CLI。仓库里有些脚本假设类 Unix shell，在 `cmd.exe` 或 PowerShell 下会出现问题。
-- **Linux**——Docker Engine。Worker 到 Manager 的网络可能需要额外配置，具体见 [配置](#配置) 中关于 Worker 回调 URL 的部分。
-
-从源码检出安装并构建：
+从本仓库安装并构建：
 
 ```bash
 npm run install:all
 npm run build
 ```
 
-直接运行确定性检查可使用 `npm run ci`。若要在本地执行 GitHub Actions 的
-Linux jobs，请先安装 Docker、[`act`](https://github.com/nektos/act) 和
-[`actionlint`](https://github.com/rhysd/actionlint)，然后运行：
-
-```bash
-npm run ci:local
-npm run ci:local -- core-linux  # 只运行一个 job
-```
-
-本地 Runner 覆盖 Linux 核心检查、UI 覆盖率和 Docker smoke；Windows job
-仍由 GitHub 的 `windows-latest` Runner 执行。
-
-CLI 通过 `atms` 暴露。先在本地 link 一下，后面的命令才能直接写成 `atms`：
+链接 CLI 并启动运行时：
 
 ```bash
 cd atms_cli && npm link && cd ..
-atms --help
-```
-
-同时启动 Manager 和 Node。首次运行会构建 `atms-worker:latest` 镜像；此后只要 worker 源码指纹发生变化，就会自动重建：
-
-```bash
 atms start
 ```
 
-检查就绪状态。`atms doctor` 会告诉你：Manager 是否可达、Node 是否可用、当前的模型设置是什么、以及 Manager Agent harness 能否解析出某个 runtime：
+`atms start` 会启动 Manager（`http://localhost:19191`）和 Node。加上 `--ui` 会同时启动浏览器 Agent UI（HTTPS `https://localhost:19192`，HTTP 回退 `http://localhost:19193`）。在 Worker 需要通过 `host.docker.internal` 访问 Manager 的 Docker 环境中，请绑定 `0.0.0.0`：
+
+```bash
+atms start --host 0.0.0.0 --ui
+```
+
+检查就绪状态：
 
 ```bash
 atms doctor
 ```
 
-先跑一个本地拓扑检查。这里使用 two-node 模板自带的离线确定性 profile，所以暂时不需要模型 provider：
-
-```bash
-atms run assets/orchestrations/public-two-node.yaml.template \
-  --profile offline-deterministic \
-  --prompt "Draft a short checklist for a backend release"
-```
-
-命令会返回一个 `run_id`；如果想看节点交接过程，可以用 `atms dag supervise <run_id>`。
-
-若要同时启动浏览器中的 Agent UI：
-
-```bash
-atms start --ui
-```
-
-默认端口为：Manager `http://localhost:19191`、Agent UI `https://localhost:19192`、HTTP 回退 `http://localhost:19193`。Manager 默认绑定 `127.0.0.1`；除非你有意让它对 localhost 之外的地址开放，否则无需改动——需要开放时使用 `atms start --host 0.0.0.0`。
-
-Android WebView 的 Live Voice 访问默认关闭。在可信局域网使用时，在 Manager
-进程环境中设置 `ATMS_ANDROID_LIVE_VOICE_ENABLED=1`，再启动或重启 Manager：
-
-```bash
-export ATMS_ANDROID_LIVE_VOICE_ENABLED=1
-atms start --host 0.0.0.0 --ui
-```
-
-仅值 `1` 启用此例外，只对精确来源 `https://appassets.androidplatform.net`
-放行 Live Voice ticket POST/预检和需要 ticket 的 Live Voice WebSocket。
-插件安装、配置修改等其他写接口仍使用原有来源规则，不会将 appassets 自动加入全局
-`ATMS_MANAGER_ADMIN_ORIGINS` 白名单。删除变量或设为 `0` 后重启即可撤销例外；
-若曾在全局白名单中显式加入 appassets，还需移除该条目才能恢复默认拒绝。
-
-appassets 是 Android WebViewAssetLoader 的共享域名，不能证明请求来自 Atms。
-开启后，能访问 Manager 并使用该来源的客户端可以申请语音票据并调用语音智能体；
-短期票据不等于设备认证。只应在可信网络显式启用，不要用于未经保护的公网 Manager。
-
-## 跑一个 DAG
-
-显式加载一个模板来运行：
-
-```bash
-atms templates list
-atms run assets/orchestrations/public-two-node.yaml.template \
-  --prompt "Draft a short project checklist"
-```
-
-需要复用的工作流，先把 DAG 同步到 Manager 数据库。编辑 YAML 时保持
-`workflow_id` 不变；只有想创建新工作流/新版本时才修改它。
-
-```bash
-atms dag sync assets/orchestrations/public-dev-5node.yaml.template
-atms profile sync assets/profiles/example-runtime.profile.yaml.template \
-  --workflow public-dev-5node-template
-atms run \
-  --workflow public-dev-5node-template \
-  --profile example-runtime \
-  --prompt "Draft a short project checklist"
-```
-
-记下返回的 `run_id`，然后审查这次运行：
-
-```bash
-atms dag supervise <run_id>
-atms scorecard <run_id>
-atms eval-run <run_id>
-```
-
-若暂时没有真实的模型 provider，只想验证拓扑，two-node 模板自带一个离线确定性 profile：
-
-```bash
-atms run assets/orchestrations/public-two-node.yaml.template \
-  --profile offline-deterministic \
-  --prompt "Draft a short checklist for a backend release"
-```
-
-## 让 coding agent 直接操作 CLI
-
-除了对 Manager Agent 说话、或者自己敲命令之外，Atms 还有第二种用法：让你已经用顺手的 coding agent——Codex、Claude Code，或任何能执行 shell 命令的工具——直接驱动 `atms` CLI：`templates list`、`run`、`dag supervise`、`scorecard`、`replay`。
-
-这种做法跳过的是 Manager Agent（那个把请求规划成 DAG 的 AI），而不是 Manager 服务（DAG 协调器）。规划的工作交给了你的 coding agent：它读模板、决定改哪里、跑一次 DAG、看结果、再迭代。这正是开发与调试 DAG、模板时最自然的工作循环——你既保有 DAG 运行时完整的审计与评估能力，又让一个你本来就在用它写代码的模型直接掌控这个循环。
-
-```text
-你 ↔ coding agent ↔ atms CLI ↔ Manager 服务 ↔ DAG 节点
-       （规划）            （协调）         （执行）
-```
-
-如果你希望 Atms 从一个请求开始，端到端地把工作流规划并跑完，尤其是用语音，那 Manager Agent 仍然是合适的选择。而当你正在搭建或调校 DAG 本身时，直接驱动 CLI 更合适。
-
-## 架构
-
-| 包 | 职责 |
-| --- | --- |
-| `atms_protocol` | 共享的消息与校验契约——运行时通信的单一真相源。 |
-| `atms_manager` | Manager 服务与 DAG 协调器。掌管语音面与生成式 UI 契约。 |
-| `atms_node` | Node 服务。负责拉起由 Docker 支撑的 Worker 容器。 |
-| `atms_worker` | Worker 运行时。Claude Agent SDK 与兼容 agent 后端的 harness 适配器。 |
-| `atms_cli` | `atms` CLI。用于配置、运行、审查 DAG 工作流。 |
-| `agent-ui` | 解耦的浏览器 UI，用于操作 Manager。渲染语音面与 widget。 |
-
-Manager 与 Node 都是本地服务。Manager 不应运行在 Worker 镜像中。Node 负责创建 Worker 容器；同一次运行的 Worker 共享 `${ATMS_HOME}/workspace/<run_id>`。
-
-### 聪明的头脑，高效的 worker
-
-最贵的模型，不该什么都由它来做。每个 DAG 节点都运行在独立的上下文窗口里：拿到它需要的交接内容，完成自己的那部分，再把证据交给下一个节点。上下文永远不会膨胀成一个臃肿的巨型线程，也不会为了塞得下，就在压力之下遭到压缩、丢失信息。正因为节点彼此独立，每个节点都可以选用不同的模型——最聪明的那个负责规划与审查，便宜、token 效率高的那些负责大部分执行。模板通过 per-agent 的 `provider` / `model` 映射来表达这一点，并以 `"*"` 通配符作为兜底默认。
-
-## 配置
-
-`ATMS_HOME` 是本地数据根目录——Manager 状态、运行工作区、日志、worker 镜像缓存，全部落在它下面。它默认是 `~/.atms`，而且增长很快：每一次 DAG 运行都会往 `${ATMS_HOME}/workspace/<run_id>/` 写入产物，并随着运行次数不断累积。因此，在开始跑真实工作之前，请把它指向一个容量充裕的磁盘（一个 NAS 挂载点，或一块大容量外置卷）：
-
-```bash
-export ATMS_HOME="/mnt/nas/atms"
-```
-
-Provider 凭证保存在 Manager 的加密设置中，绝不写入仓库文件。从 provider 目录配置一个模型：
+配置模型（凭据加密存储在 Manager 中，永远不会写入仓库文件）：
 
 ```bash
 atms model configure <provider-or-endpoint-alias> \
@@ -203,59 +74,118 @@ atms model configure <provider-or-endpoint-alias> \
 atms model list
 ```
 
-模型配置好之后，再运行完整的公开 smoke DAG。它会走完五节点流程（plan → implement → test → review → summarize），并校验 scorecard 与 eval-run：
+运行一次无模型的拓扑检查（离线确定性后端）：
 
 ```bash
-atms smoke dag \
-  --template assets/orchestrations/public-dev-5node.yaml.template
+atms run assets/orchestrations/public-two-node.yaml.template \
+  --profile offline-deterministic \
+  --prompt "Draft a short checklist for a backend release"
 ```
 
-跑通之后，产物会落在共享的运行工作区：
-
-```text
-${ATMS_HOME}/workspace/<run_id>/snake-game/index.html
-${ATMS_HOME}/workspace/<run_id>/snake-game/TESTS.md
-```
-
-CLI 按以下顺序解析 Manager URL：`--base-url`、`ATMS_MANAGER_URL`、`${ATMS_HOME}/config.json`，最后是 `http://localhost:19191`。
-
-若通过反向代理提供公网访问，需要通告外部 endpoint，并将 UI 绑定到机器 IP：
+然后运行一个真实的五节点开发 DAG（plan → implement → test → review → summarize）并查看结果：
 
 ```bash
-atms start --ui --public \
-  --public-url https://atms.example.com \
-  --ui-public-url https://atms-ui.example.com
+atms run assets/orchestrations/public-dev-5node.yaml.template \
+  --prompt "Build a small static web page about coffee brewing"
+atms dag supervise <run_id>
+atms scorecard <run_id>
+atms trace <run_id>
 ```
 
-`--ui-public-url`（或 `ATMS_UI_PUBLIC_URL`）必须是精确的 `http(s)`
-Origin，不能包含通配符、路径、查询参数、片段或凭据。未显式配置时，
-受保护的 UI 操作只接受 localhost、`.localhost` 或字面 IP；
-`atms.lan`、mDNS 名称和自定义域名必须通过该参数固定，否则相关请求
-和浏览器工具票据会以 HTTP 403 安全拒绝。这一限制用于防止 DNS 重绑定。
+打开 `http://localhost:19193`，向 Manager Agent 提出一个任务——它会规划一个 DAG，你可以在实时画布上逐节点观察执行过程。
 
-Worker 容器通过 Manager 传给 Node 的那个 URL，回连到 Manager。在 Docker Desktop 上，默认的 `host.docker.internal` 映射通常就够了；在 Linux 上，要么使用 Docker 的 `host-gateway` 支持，要么设置 `ATMS_MANAGER_WORKER_WS_BASE_URL`。不要在模板或提交的配置中硬编码 Docker 网桥地址。
+## 运行管理
 
-远程 Worker 和 Node 必须使用经过身份认证的 `wss://` 端点。token、反向代理、证书和兼容设置见 [控制面 WebSocket 安全说明](docs/control-plane-security.md)。
-
-运行时辅助命令：
+`atms` CLI 是完整控制面：
 
 ```bash
-atms runtime status
-atms runtime logs
-atms runtime stop
-atms ui status
-atms ui logs
-atms ui stop
+atms run [template] [--workflow <id>] [--profile <id>] --prompt "..."   # 启动运行
+atms runs                                                                # 列出运行
+atms status <run_id>                                                     # 状态
+atms stop <run_id>                                                       # 停止
+atms dag supervise <run_id>                                              # 观察交接流程
+atms scorecard <run_id>                                                  # 按节点记分卡
+atms eval-run <run_id>                                                   # 评估报告
+atms replay <run_id>                                                     # 重放计划
+atms trace <run_id>                                                      # 执行轨迹
+atms inject <run_id> <node_id> <instruction>                             # 向运行中的节点注入指令
+atms resume <run_id> <node_id>                                           # 从检查点 fork + 恢复
 ```
 
-## 项目方向
+工作流（workflow）和运行配置（profile）可以同步到 Manager 中复用：
 
-Atms 最终要成为一个常驻于家庭数据中心的 agent——语音输入，生成式 UI 输出，多个节点、多种终端（手机、平板、TV、车机）。当前这个仓库是走向它的第一步，完整计划见 [ROADMAP.md](ROADMAP.md)。
+```bash
+atms dag sync assets/orchestrations/public-dev-5node.yaml.template
+atms profile sync assets/profiles/example-runtime.profile.yaml.template --workflow <workflow_id>
+atms run --workflow <workflow_id> --profile <profile_id> --prompt "..."
+```
 
-对于语音 Manager Agent，**Codex（`codex_appserver`）是当前推荐的 harness**：它是目前唯一一条能够从模型的原生 reasoning 流，自动合成 `commentary` 语音频道的路径，因此用户能在工作发生的同时听到进度。其他 harness（`claude-sdk`、`kimi-code`）在执行过程中是静默的——这是 provider 能力的差异，并非 Atms 能够弥补。
+内置的 [DAG 模式库](docs/dag-patterns.md) 提供了可复用的控制流设计（quorum、bounded ratchet、持续目标验证、planner/worker fan-out）：
 
-## License
+```bash
+atms patterns list
+atms patterns instantiate quorum --set workflow_id=release-quorum --set threshold=2
+```
 
-MIT。详见 [LICENSE](LICENSE)。
+## 可复用的场景模板
 
-无人值守的 Auto Fix 与 PR 检查可使用[持久化事件监控](docs/scenarios/event-supervision.zh-CN.md)，由后台程序等待并恢复结果。
+`assets/orchestrations/` 包含开箱即用的模板：
+
+- `public-two-node.yaml.template` — 最小双节点拓扑检查（可离线运行）
+- `public-dev-5node.yaml.template` — plan → implement → test → review → summarize
+- `auto-fix.yaml.template` / `auto-fix-v2.yaml.template` — GitHub issue → 修复 → PR 流水线
+- `pr-review.yaml.template` / `pr-closeout.yaml.template` — 证据驱动的 PR 评审与收尾
+- `workflow-spec-v1-*.yaml.template` — WorkflowSpec v1 控制流示例（condition、fanout、foreach、bounded while）
+- `multi-actor-live-report.yaml.template` — 多 actor 实时报告
+
+关于在持久化边界暂停、并在同一次运行下恢复选定 actor 的多轮工作流，见 [Multi-Round DAGs](docs/multi-round-dags.md)。关于在持久化 Linux 主机上无人值守运行 Auto Fix 和 PR 检查，见 [事件监督](docs/scenarios/event-supervision.md)。
+
+## Agent 后端
+
+每个 DAG 节点运行一个 worker 后端（在模板中按 agent 选择，带 `*` 兜底）：
+
+| 后端 | 说明 |
+| --- | --- |
+| `claude-sdk` | Claude Agent SDK。默认的生产 worker 运行时。 |
+| `codex_appserver` | OpenAI Codex。语音 Manager Agent 的推荐 harness——它能从模型的推理流自动合成口语化的 `commentary` 声道。 |
+| `deepseek_harness` | 实验性。在进程外运行维护中的 DSH fork，并把其推理流映射为 Atms thinking 事件。见[集成文档](docs/architecture/deepseek-harness-integration.md)。 |
+| `kimi_code` | Kimi Code 适配器。执行期间静默（提供商能力限制）。 |
+| `deterministic` | 离线、非 LLM 后端，用于测试和拓扑检查。 |
+
+就语音 Manager Agent 而言，目前推荐 `codex_appserver`；`claude-sdk` 和 `kimi_code` 执行期间静默，`deepseek_harness` 仍属实验性。
+
+## 插件
+
+插件是带 manifest（`atms.plugin.json`）、JSON schema、fixtures、UI projector 和 skill 的可安装包：
+
+```bash
+atms plugin list
+atms plugin install <path-or-package>
+```
+
+内置插件：`core-generative-ui`、`pr-closeout`、`topic-outline`。`plugins/examples/` 中的示例：release notes 和 video cover（带离线测试用的 fake GPU runtime）。
+
+## 开发
+
+```bash
+npm run typecheck          # 所有包
+npm run build              # 所有包
+npm run test               # 构建 + 完整测试套件
+npm run ci                 # typecheck + build + test（CI 流水线）
+npm run ci:local           # 在本地运行 Linux GitHub Actions 任务（需要 Docker、act、actionlint）
+```
+
+主要文档：
+
+- [docs/architecture/](docs/architecture/) — durable DAG actors、deepseek-harness 集成、live steering、live surface projector
+- [docs/dag-workflow-spec-v1-design.md](docs/dag-workflow-spec-v1-design.md) — WorkflowSpec v1
+- [docs/control-plane-security.md](docs/control-plane-security.md) — 远程 Node/Worker 的认证 `wss://`
+- [docs/worker-build-network.md](docs/worker-build-network.md) — 受限网络下的镜像源与代理
+- [docs/production-deployment.md](docs/production-deployment.md) — 反向代理与公网 Origin
+
+## 配置说明
+
+- `ATMS_HOME`（默认 `~/.atms`）— 本地数据根目录：Manager 状态、运行工作区、日志。请指向有足够空间的磁盘；每次运行都会在 `${ATMS_HOME}/workspace/<run_id>/` 下累积产物。
+- Worker 到 Manager 的网络 — Docker Desktop 上默认的 `host.docker.internal` 映射即可工作；Linux 上请使用 Docker `host-gateway` 或设置 `ATMS_MANAGER_WORKER_WS_BASE_URL`。不要硬编码网桥地址。
+- 公网/反向代理访问 — `atms start --ui --public --ui-public-url https://atms.example.com`；Origin 必须是精确的 `http(s)` Origin。
+- 捆绑 WebView 的 Android Live Voice 是 opt-in（`ATMS_ANDROID_LIVE_VOICE_ENABLED=1`），只应在受信任的局域网内启用。
