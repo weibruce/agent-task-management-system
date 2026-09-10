@@ -1,0 +1,341 @@
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { CirclePause, Eye, EyeOff, Loader2, Network, RotateCcw, Settings } from 'lucide-vue-next'
+import { useI18n } from 'vue-i18n'
+import { http } from '@/api/clients/http-client'
+
+const { t } = useI18n()
+
+const props = defineProps<{
+  activeMode: 'text' | 'voice'
+  showSettings?: boolean
+  showDetails?: boolean
+  detailsOpen?: boolean
+  voiceOnly?: boolean
+  showRuntime?: boolean
+}>()
+
+const emit = defineEmits<{
+  selectText: []
+  selectVoice: []
+  openSettings: []
+  toggleDetails: []
+  openRuntime: []
+}>()
+
+function modeClass(mode: 'text' | 'voice'): string {
+  return props.activeMode === mode
+    ? 'bg-[var(--atms-accent)] text-[var(--atms-on-accent)] shadow-[0_0_20px_color-mix(in_srgb,var(--atms-accent)_18%,transparent)]'
+    : 'text-[var(--atms-text-2)] hover:bg-[var(--atms-surface-2)] hover:text-[var(--atms-text-1)]'
+}
+
+interface ActiveRunsResponse {
+  runs?: Array<{ runId: string; status: string }>
+  total?: number
+}
+
+const activeRunCount = ref(0)
+const waitingRunCount = ref(0)
+let activeRunTimer: ReturnType<typeof setInterval> | null = null
+
+const hasActiveRuns = computed(() => activeRunCount.value > 0)
+const hasWaitingRuns = computed(() => waitingRunCount.value > 0)
+const runtimeRunCount = computed(() => activeRunCount.value + waitingRunCount.value)
+const desktopUpdateStatus = ref<DesktopUpdateStatus | null>(null)
+const installRequestPending = ref(false)
+const retryRequestPending = ref(false)
+let removeUpdateListener: (() => void) | null = null
+
+const runtimeTitle = computed(() => {
+  if (hasActiveRuns.value && hasWaitingRuns.value) {
+    return t('shell.dashboard.runningAndWaiting', {
+      active: activeRunCount.value,
+      waiting: waitingRunCount.value,
+    })
+  }
+  if (hasActiveRuns.value) return t('shell.dashboard.running', { count: activeRunCount.value })
+  if (hasWaitingRuns.value) return t('shell.dashboard.waiting', { count: waitingRunCount.value })
+  return t('shell.dashboard.title')
+})
+const installFailure = computed(() =>
+  Boolean(
+    desktopUpdateStatus.value?.supported
+    && desktopUpdateStatus.value.state === 'error'
+    && desktopUpdateStatus.value.installStartedAt,
+  ),
+)
+const updateInstalling = computed(() =>
+  installRequestPending.value || desktopUpdateStatus.value?.state === 'installing',
+)
+const updateActionPending = computed(() =>
+  updateInstalling.value || retryRequestPending.value,
+)
+const updateRetrySupported = computed(() =>
+  Boolean(desktopBridge()?.checkForUpdates),
+)
+const updateActionVisible = computed(() =>
+  Boolean(
+    desktopUpdateStatus.value?.supported
+    && (
+      desktopUpdateStatus.value.state === 'downloaded'
+      || desktopUpdateStatus.value.state === 'installing'
+      || installFailure.value
+    ),
+  ),
+)
+const updateButtonTitle = computed(() => {
+  if (retryRequestPending.value) return t('shell.updates.checking')
+  if (installFailure.value) {
+    return desktopUpdateStatus.value?.error || t('shell.updates.failed')
+  }
+  if (updateInstalling.value) return t('shell.updates.installing')
+  const version = desktopUpdateStatus.value?.update?.version
+  return version ? t('shell.updates.downloadedVersion', { version }) : t('shell.updates.downloaded')
+})
+const updateButtonText = computed(() => {
+  if (retryRequestPending.value) return t('shell.updates.checking')
+  if (installFailure.value) return t('shell.updates.retry')
+  if (updateInstalling.value) return t('shell.updates.installing')
+  return t('shell.updates.restart')
+})
+
+async function refreshActiveRuns(): Promise<void> {
+  if (!props.showRuntime) {
+    activeRunCount.value = 0
+    waitingRunCount.value = 0
+    return
+  }
+  try {
+    const res = await http.get<ActiveRunsResponse>('/api/runs/active/list')
+    const data = (res.data ?? res) as ActiveRunsResponse
+    if (data.runs) {
+      activeRunCount.value = data.runs.filter(run => run.status === 'active').length
+      waitingRunCount.value = data.runs.filter(run => run.status === 'waiting').length
+    } else {
+      activeRunCount.value = Number(data.total ?? 0)
+      waitingRunCount.value = 0
+    }
+  } catch {
+    activeRunCount.value = 0
+    waitingRunCount.value = 0
+  }
+}
+
+function startActiveRunPolling(): void {
+  if (activeRunTimer) return
+  void refreshActiveRuns()
+  activeRunTimer = setInterval(() => {
+    void refreshActiveRuns()
+  }, 5000)
+}
+
+function stopActiveRunPolling(): void {
+  if (!activeRunTimer) return
+  clearInterval(activeRunTimer)
+  activeRunTimer = null
+}
+
+function desktopBridge(): AtmsDesktopBridge | null {
+  return typeof window === 'undefined' ? null : window.atmsDesktop ?? null
+}
+
+function startDesktopUpdateWatcher(): void {
+  const bridge = desktopBridge()
+  if (!bridge?.updateStatus) return
+
+  removeUpdateListener = bridge.onUpdateStatus?.((status) => {
+    desktopUpdateStatus.value = status
+    if (status.state === 'installing' || status.state === 'error') {
+      installRequestPending.value = false
+    }
+    retryRequestPending.value = false
+  }) ?? null
+
+  void bridge.updateStatus()
+    .then((status) => {
+      desktopUpdateStatus.value = status
+      if (status.state === 'downloaded' || status.state === 'installing' || !bridge.checkForUpdates) return
+      void bridge.checkForUpdates()
+        .then((nextStatus) => {
+          desktopUpdateStatus.value = nextStatus
+        })
+        .catch(() => undefined)
+    })
+    .catch(() => {
+      desktopUpdateStatus.value = null
+    })
+}
+
+function stopDesktopUpdateWatcher(): void {
+  removeUpdateListener?.()
+  removeUpdateListener = null
+}
+
+async function installDesktopUpdate(): Promise<void> {
+  const bridge = desktopBridge()
+  const downloadedStatus = desktopUpdateStatus.value
+  if (
+    !bridge?.installUpdate
+    || updateInstalling.value
+    || downloadedStatus?.state !== 'downloaded'
+  ) return
+  installRequestPending.value = true
+  try {
+    desktopUpdateStatus.value = await bridge.installUpdate()
+  } catch (error) {
+    desktopUpdateStatus.value = {
+      ...downloadedStatus,
+      state: 'error',
+      error: error instanceof Error ? error.message : String(error),
+      installStartedAt: Date.now(),
+    }
+  } finally {
+    installRequestPending.value = false
+  }
+}
+
+async function retryDesktopUpdateCheck(): Promise<void> {
+  const bridge = desktopBridge()
+  const failedStatus = desktopUpdateStatus.value
+  if (
+    !bridge?.checkForUpdates
+    || retryRequestPending.value
+    || failedStatus?.state !== 'error'
+    || !failedStatus.installStartedAt
+  ) return
+  retryRequestPending.value = true
+  try {
+    desktopUpdateStatus.value = await bridge.checkForUpdates()
+  } catch (error) {
+    desktopUpdateStatus.value = {
+      ...failedStatus,
+      error: error instanceof Error ? error.message : String(error),
+    }
+  } finally {
+    retryRequestPending.value = false
+  }
+}
+
+function handleDesktopUpdateAction(): void {
+  if (installFailure.value) {
+    void retryDesktopUpdateCheck()
+    return
+  }
+  void installDesktopUpdate()
+}
+
+onMounted(() => {
+  if (props.showRuntime) startActiveRunPolling()
+  startDesktopUpdateWatcher()
+})
+
+watch(() => props.showRuntime, (showRuntime) => {
+  if (showRuntime) {
+    startActiveRunPolling()
+  } else {
+    stopActiveRunPolling()
+    activeRunCount.value = 0
+    waitingRunCount.value = 0
+  }
+})
+
+onBeforeUnmount(() => {
+  stopActiveRunPolling()
+  stopDesktopUpdateWatcher()
+})
+</script>
+
+<template>
+  <header class="agent-mode-topbar flex h-14 flex-shrink-0 items-center justify-between rounded-full border border-[var(--atms-border)] bg-[var(--atms-panel)] px-3 shadow-2xl backdrop-blur-xl">
+    <div class="agent-mode-topbar__left flex min-w-0 items-center gap-3 overflow-x-auto">
+      <div class="agent-mode-topbar__brand hidden px-2 text-[11px] font-medium tracking-[0.22em] text-[var(--atms-text-3)] sm:block">
+        Atms
+      </div>
+      <div v-if="!voiceOnly" class="agent-mode-topbar__mode flex h-10 items-center rounded-full border border-[var(--atms-border)] bg-[var(--atms-surface-1)] p-1">
+        <button
+          class="h-8 rounded-full px-3 text-xs font-medium transition-colors"
+          :class="modeClass('text')"
+          type="button"
+          @click="emit('selectText')"
+        >
+          {{ t('shell.mode.text') }}
+        </button>
+        <button
+          class="h-8 rounded-full px-3 text-xs font-medium transition-colors"
+          :class="modeClass('voice')"
+          type="button"
+          @click="emit('selectVoice')"
+        >
+          {{ t('shell.mode.voice') }}
+        </button>
+      </div>
+      <slot />
+    </div>
+
+    <div class="agent-mode-topbar__right flex flex-shrink-0 items-center gap-2">
+      <slot name="right" />
+      <button
+        v-if="updateActionVisible"
+        class="flex h-9 items-center gap-2 rounded-full border border-[var(--atms-accent-border)] bg-[var(--atms-accent-soft)] px-3 text-sm font-medium text-[var(--atms-accent)] transition-colors hover:opacity-85"
+        :title="updateButtonTitle"
+        type="button"
+        data-testid="desktop-update-install"
+        :aria-busy="updateActionPending"
+        :disabled="updateActionPending || (installFailure && !updateRetrySupported)"
+        @click="handleDesktopUpdateAction"
+      >
+        <RotateCcw class="h-4 w-4" :class="updateActionPending ? 'animate-spin' : ''" />
+        {{ updateButtonText }}
+      </button>
+      <button
+        v-if="showRuntime"
+        class="flex h-9 items-center gap-2 rounded-full border px-3 text-sm transition-colors hover:bg-[var(--atms-surface-2)] hover:text-[var(--atms-text-1)]"
+        :class="hasActiveRuns
+          ? 'border-[var(--atms-success-border)] bg-[var(--atms-success-soft)] text-[var(--atms-success)] shadow-[0_0_18px_var(--atms-success-soft)]'
+          : hasWaitingRuns
+            ? 'border-[var(--atms-warning-border)] bg-[var(--atms-warning-soft)] text-[var(--atms-warning)]'
+            : 'border-[var(--atms-border)] text-[var(--atms-text-2)]'"
+        :data-state="hasActiveRuns ? 'active' : hasWaitingRuns ? 'waiting' : 'idle'"
+        data-testid="dag-runtime-button"
+        :title="runtimeTitle"
+        type="button"
+        @click="emit('openRuntime')"
+      >
+        <Loader2 v-if="hasActiveRuns" class="h-4 w-4 animate-spin" />
+        <CirclePause v-else-if="hasWaitingRuns" class="h-4 w-4" />
+        <Network v-else class="h-4 w-4" />
+        {{ t('shell.dashboard.button') }}
+        <span
+          v-if="runtimeRunCount > 0"
+          class="min-w-5 rounded-full border px-1.5 text-center text-[11px] font-semibold leading-5"
+          :class="hasActiveRuns
+            ? 'border-[var(--atms-success-border)] bg-[var(--atms-success-soft)] text-[var(--atms-success)]'
+            : 'border-[var(--atms-warning-border)] bg-[var(--atms-warning-soft)] text-[var(--atms-warning)]'"
+        >
+          {{ runtimeRunCount }}
+        </span>
+      </button>
+      <button
+        v-if="showDetails"
+        class="flex h-9 items-center gap-2 rounded-full border border-[var(--atms-border)] px-3 text-sm text-[var(--atms-text-2)] transition-colors hover:bg-[var(--atms-surface-2)] hover:text-[var(--atms-text-1)]"
+        :title="detailsOpen ? t('shell.details.hide') : t('shell.details.show')"
+        type="button"
+        @click="emit('toggleDetails')"
+      >
+        <EyeOff v-if="detailsOpen" class="h-4 w-4" />
+        <Eye v-else class="h-4 w-4" />
+        {{ t('shell.details.button') }}
+      </button>
+      <button
+        v-if="showSettings"
+        class="flex h-9 items-center gap-2 rounded-full border border-[var(--atms-border)] px-3 text-sm text-[var(--atms-text-2)] transition-colors hover:bg-[var(--atms-surface-2)] hover:text-[var(--atms-text-1)]"
+        data-testid="agent-mode-settings-button"
+        type="button"
+        @click="emit('openSettings')"
+      >
+        <Settings class="h-4 w-4" />
+        {{ t('shell.settings') }}
+      </button>
+    </div>
+  </header>
+</template>

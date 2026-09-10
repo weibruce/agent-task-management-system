@@ -1,0 +1,4 @@
+interface:
+  display_name: "Atms Shared"
+  short_description: "Shared Atms CLI, service, security, and local-source rules."
+  default_prompt: "Use $atms-shared while installing, configuring, or operating Atms."

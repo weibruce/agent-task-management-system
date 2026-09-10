@@ -1,0 +1,30 @@
+{
+  "name": "atms",
+  "version": "0.1.0-beta.1",
+  "private": true,
+  "description": "Voice-first local agent orchestration runtime for auditable DAG workflows.",
+  "license": "MIT",
+  "scripts": {
+    "install:all": "npm --prefix atms_protocol ci && npm --prefix atms_plugin_sdk ci && npm --prefix atms_manager ci && npm --prefix atms_node ci && npm --prefix atms_worker ci && npm --prefix atms_cli ci && npm --prefix agent-ui ci",
+    "build:packages": "npm --prefix atms_protocol run build && npm --prefix atms_plugin_sdk run build && npm --prefix atms_manager run build && npm --prefix atms_node run build && npm --prefix atms_worker run build && npm --prefix atms_cli run build && npm --prefix agent-ui run build",
+    "build": "npm run build:packages",
+    "test:live-validator": "node --test scripts/pr-review-execution-evidence.test.mjs scripts/auto-fix-artifacts.test.mjs scripts/auto-fix-checkpoint.test.mjs scripts/auto-fix-runtime-profile.test.mjs scripts/auto-fix-v2-runtime-profile.test.mjs scripts/dag-pattern-live-contracts.test.mjs scripts/live-run-progress.test.mjs scripts/live-runner-isolation.test.mjs scripts/manager-only-restart-evidence.test.mjs scripts/pr-privacy-advisory.test.mjs scripts/pr-review-runtime-profile.test.mjs scripts/prepare-auto-fix-input.test.mjs scripts/production-deploy-contracts.test.mjs scripts/stable-automation-contracts.test.mjs scripts/three-worker-showcase-adapter.test.mjs scripts/three-worker-showcase-contracts.test.mjs scripts/judged-autofix/loop.test.mjs scripts/event-supervisor.test.mjs",
+    "test:packages": "npm --prefix atms_protocol test && npm --prefix atms_plugin_sdk test && npm --prefix atms_manager test && npm --prefix atms_node test && npm --prefix atms_worker test && npm --prefix atms_cli test && npm --prefix agent-ui test && npm run test:live-validator",
+    "test": "npm run build:packages && npm run test:packages",
+    "typecheck": "npm --prefix atms_protocol run typecheck && npm --prefix atms_plugin_sdk run typecheck && npm --prefix atms_manager run typecheck && npm --prefix atms_node run typecheck && npm --prefix atms_worker run typecheck && npm --prefix atms_cli run typecheck && npm --prefix agent-ui run typecheck",
+    "e2e:agent-ui": "npm --prefix agent-ui run e2e",
+    "validate:dag-patterns-live": "node scripts/validate-dag-patterns-live.mjs",
+    "validate:dag-patterns-runner": "bash scripts/run-dag-patterns-live-runner.sh",
+    "validate:three-worker-showcase": "node scripts/validate-three-worker-showcase.mjs",
+    "validate:three-worker-showcase-runner": "bash scripts/run-three-worker-showcase-live-runner.sh",
+    "smoke:run-artifacts": "node scripts/run-artifact-live-smoke.mjs",
+    "audit": "npm --registry=https://registry.npmjs.org --prefix atms_protocol audit --audit-level=high && npm --registry=https://registry.npmjs.org --prefix atms_plugin_sdk audit --audit-level=high && npm --registry=https://registry.npmjs.org --prefix atms_manager audit --audit-level=high && npm --registry=https://registry.npmjs.org --prefix atms_node audit --audit-level=high && npm --registry=https://registry.npmjs.org --prefix atms_worker audit --audit-level=high && npm --registry=https://registry.npmjs.org --prefix atms_cli audit --audit-level=high && npm --registry=https://registry.npmjs.org --prefix agent-ui audit --audit-level=high",
+    "ci": "npm run typecheck && npm run build:packages && npm run test:packages",
+    "ci:local": "bash scripts/ci-local.sh",
+    "smoke": "npm run ci"
+  },
+  "engines": {
+    "node": ">=20",
+    "npm": ">=10"
+  }
+}

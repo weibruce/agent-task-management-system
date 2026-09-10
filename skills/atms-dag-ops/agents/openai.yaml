@@ -1,0 +1,4 @@
+interface:
+  display_name: "Atms DAG Ops"
+  short_description: "Run, monitor, inspect, and author Atms DAG workflows."
+  default_prompt: "Use $atms-dag-ops to run a Atms DAG, monitor it, inspect handoffs, or write a DAG template."

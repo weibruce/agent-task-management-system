@@ -1,0 +1,4 @@
+interface:
+  display_name: "Atms CLI"
+  short_description: "Use the local-source Atms CLI for runtime, model, DAG, and evidence commands."
+  default_prompt: "Use $atms-cli when you need Atms CLI commands, flags, or evidence inspection."

@@ -1,0 +1,15 @@
+/* src/styles/tailwind.css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+*:focus {
+    outline: none;
+    box-shadow: none;
+  }
+
+  /* Appearance-aware native select focus. */
+  select:focus {
+    border-color: var(--atms-accent-border);
+    box-shadow: 0 0 0 3px var(--atms-focus-ring);
+  }

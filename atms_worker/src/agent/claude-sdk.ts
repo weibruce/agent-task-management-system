@@ -1,0 +1,1213 @@
+/**
+ * Claude Agent SDK adapter — wraps @anthropic-ai/claude-agent-sdk.
+ *
+ * Uses `query()` for one-shot agent execution. DAG tools are registered
+ * via an in-process MCP server created with `createSdkMcpServer`.
+ * @version 0.1.0
+ */
+
+import { AGENT_BUILTIN_TOOL_NAMES } from "atms-protocol";
+import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import {
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import type { AgentClient, AgentEvent, AgentRunContext, AgentUsage, DagToolDefinition } from "./types.js";
+import {
+  jsonSchemaObjectToZodRawShape,
+  normalizeJsonObjectStringsBySchema,
+} from "./json-schema-zod.js";
+import { sanitizedAgentChildEnv } from "./child-env.js";
+import { createWorkspaceReadToolHook } from "./workspace-read-policy.js";
+import { WORKER_RUNTIME_VERSION } from "../runtime-version.js";
+import { createBuiltinToolBudgetHook } from "./builtin-tool-budget.js";
+
+const HANDOFF_ONLY_THINKING_BUDGET = 2048;
+const HANDOFF_STOP = Symbol("claude-sdk-handoff-stop");
+const DAG_TOOLS_MCP_SERVER_NAME = "dag-tools";
+const AGENT_USAGE_KEYS = [
+  "input_tokens",
+  "output_tokens",
+  "cache_read_input_tokens",
+  "cache_creation_input_tokens",
+] as const satisfies ReadonlyArray<keyof AgentUsage>;
+
+interface ClaudeSkillProjectionRuntime {
+  configDir: string;
+  skillCount: number;
+  cleanup: () => void;
+}
+
+function projectedSkillName(value: string, fallback: string): string {
+  const normalized = value
+    .normalize("NFKC")
+    .replace(/[^A-Za-z0-9_.-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+  return normalized || fallback;
+}
+
+function projectedSkillInstructions(content: string): string {
+  const normalized = content.replace(/\r\n/g, "\n");
+  if (!normalized.startsWith("---\n")) return normalized.trim();
+  const end = normalized.indexOf("\n---\n", 4);
+  return end < 0 ? normalized.trim() : normalized.slice(end + 5).trim();
+}
+
+function linkOrCopySkill(source: string, destination: string): void {
+  try {
+    symlinkSync(source, destination, process.platform === "win32" ? "junction" : "dir");
+  } catch {
+    cpSync(source, destination, { recursive: true, force: false, errorOnExist: true });
+  }
+}
+
+function persistentClaudeSessionId(context: AgentRunContext): string | undefined {
+  const sessionId = context.sessionId?.trim();
+  return context.persistSession === true
+    && sessionId !== undefined
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(sessionId)
+    ? sessionId
+    : undefined;
+}
+
+function prepareClaudeSkillProjection(context: AgentRunContext): ClaudeSkillProjectionRuntime | undefined {
+  const projection = context.skillProjection;
+  if (!projection) return undefined;
+  const configuredRoot = process.env.ATMS_HOME?.trim();
+  const parent = configuredRoot
+    ? join(configuredRoot, "runtime", "claude-skill-projections")
+    : join(tmpdir(), "atms-claude-skill-projections");
+  mkdirSync(parent, { recursive: true });
+  const persistentSessionId = persistentClaudeSessionId(context);
+  const configDir = persistentSessionId
+    ? join(parent, "manager-sessions", persistentSessionId)
+    : mkdtempSync(join(parent, `${process.pid}-`));
+  if (persistentSessionId && context.resumeSession !== true) {
+    rmSync(configDir, { recursive: true, force: true });
+  }
+  mkdirSync(configDir, { recursive: true });
+  const skillsDir = join(configDir, "skills");
+  // A persisted Claude session keeps its SDK state, but its native Skill
+  // catalog must still match the exact snapshot resolved for this turn.
+  rmSync(skillsDir, { recursive: true, force: true });
+  mkdirSync(skillsDir, { recursive: true });
+  const names = new Set<string>();
+
+  for (const directory of projection.directories ?? []) {
+    const root = resolve(directory);
+    let entries;
+    try {
+      entries = readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      const source = join(root, entry.name);
+      let resolvedSource: string;
+      try {
+        resolvedSource = resolve(source);
+        if (!statSync(join(resolvedSource, "SKILL.md")).isFile()) continue;
+      } catch {
+        continue;
+      }
+      const name = projectedSkillName(entry.name, `skill-${names.size + 1}`);
+      if (names.has(name)) continue;
+      const destination = join(skillsDir, name);
+      if (!statSync(destination, { throwIfNoEntry: false })) linkOrCopySkill(resolvedSource, destination);
+      names.add(name);
+    }
+  }
+
+  for (const definition of projection.definitions ?? []) {
+    const baseName = projectedSkillName(definition.name || definition.id, `skill-${names.size + 1}`);
+    let name = baseName;
+    let suffix = 2;
+    while (names.has(name)) {
+      const suffixText = String(suffix++);
+      name = `${baseName.slice(0, 63 - suffixText.length)}-${suffixText}`;
+    }
+    const skillDir = join(skillsDir, name);
+    if (!statSync(skillDir, { throwIfNoEntry: false })) {
+      mkdirSync(skillDir, { recursive: true });
+      writeFileSync(join(skillDir, "SKILL.md"), [
+        "---",
+        `name: ${JSON.stringify(name)}`,
+        `description: ${JSON.stringify((definition.description || `Atms Skill ${definition.id}`).slice(0, 1024))}`,
+        "---",
+        "",
+        projectedSkillInstructions(definition.content),
+        "",
+      ].join("\n"), { encoding: "utf8", mode: 0o600 });
+    }
+    names.add(name);
+  }
+
+  return {
+    configDir,
+    skillCount: names.size,
+    cleanup: () => {
+      if (!persistentSessionId) rmSync(configDir, { recursive: true, force: true });
+    },
+  };
+}
+
+export const _prepareClaudeSkillProjectionForTest = prepareClaudeSkillProjection;
+
+interface SdkModule {
+  query(params: {
+    prompt: string | AsyncIterable<SDKUserMessage>;
+    options?: Record<string, unknown>;
+  }): AsyncIterable<SdkMessage>;
+  createSdkMcpServer(opts: {
+    name: string;
+    version?: string;
+    tools?: Array<Record<string, unknown>>;
+  }): Record<string, unknown>;
+  tool(
+    name: string,
+    description: string,
+    inputSchema: Record<string, unknown>,
+    handler: (args: Record<string, unknown>, extra: unknown) => Promise<{
+      content: Array<{ type: "text"; text: string }>;
+      isError?: boolean;
+    }>,
+  ): Record<string, unknown>;
+}
+
+interface SdkMessage {
+  type: string;
+  message?: {
+    id?: string;
+    content?: Array<{
+      type: string;
+      text?: string;
+      thinking?: string;
+      id?: string;
+      name?: string;
+      input?: Record<string, unknown>;
+      tool_use_id?: string;
+      content?: unknown;
+      is_error?: boolean;
+    }>;
+    stop_reason?: string;
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
+      output_token_limit?: number;
+      max_output_tokens?: number;
+      output_tokens_limit?: number;
+      max_tokens?: number;
+    };
+  };
+  event?: {
+    type: string;
+    content_block?: {
+      type: string;
+      text?: string;
+      thinking?: string;
+      id?: string;
+      name?: string;
+      input?: Record<string, unknown>;
+    };
+  };
+  subtype?: string;
+  result?: string;
+  error?: string;
+  errors?: string[];
+  duration_ms?: number;
+  num_turns?: number;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+    output_token_limit?: number;
+    max_output_tokens?: number;
+    output_tokens_limit?: number;
+    max_tokens?: number;
+  };
+  permission_denials?: unknown[];
+  is_error?: boolean;
+}
+
+interface SdkInputEntry {
+  message: SDKUserMessage;
+  resolveApplied?: () => void;
+  rejectApplied?: (error: Error) => void;
+}
+
+function sdkUserMessage(content: string): SDKUserMessage {
+  return {
+    type: "user",
+    message: { role: "user", content },
+    parent_tool_use_id: null,
+  };
+}
+
+export class ClaudeSdkUserMessageQueue implements AsyncIterable<SDKUserMessage> {
+  private readonly entries: SdkInputEntry[] = [];
+  private readonly waiters: Array<(result: IteratorResult<SDKUserMessage>) => void> = [];
+  private closed = false;
+  private closeError = new Error("Claude SDK input queue is closed");
+
+  constructor(initialPrompt: string) {
+    this.entries.push({ message: sdkUserMessage(initialPrompt) });
+  }
+
+  enqueue(content: string): Promise<void> {
+    if (this.closed) return Promise.reject(this.closeError);
+    return new Promise<void>((resolve, reject) => {
+      const entry: SdkInputEntry = {
+        message: sdkUserMessage(content),
+        resolveApplied: resolve,
+        rejectApplied: reject,
+      };
+      const waiter = this.waiters.shift();
+      if (waiter) this.deliver(waiter, entry);
+      else this.entries.push(entry);
+    });
+  }
+
+  close(error?: Error): void {
+    if (this.closed) return;
+    this.closed = true;
+    if (error) this.closeError = error;
+    for (const entry of this.entries.splice(0)) entry.rejectApplied?.(this.closeError);
+    for (const waiter of this.waiters.splice(0)) waiter({ value: undefined, done: true });
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
+    return {
+      next: () => this.next(),
+      return: async () => {
+        this.close();
+        return { value: undefined, done: true };
+      },
+    };
+  }
+
+  private next(): Promise<IteratorResult<SDKUserMessage>> {
+    const entry = this.entries.shift();
+    if (entry) {
+      entry.resolveApplied?.();
+      return Promise.resolve({ value: entry.message, done: false });
+    }
+    if (this.closed) return Promise.resolve({ value: undefined, done: true });
+    return new Promise((resolve) => this.waiters.push(resolve));
+  }
+
+  private deliver(
+    waiter: (result: IteratorResult<SDKUserMessage>) => void,
+    entry: SdkInputEntry,
+  ): void {
+    entry.resolveApplied?.();
+    waiter({ value: entry.message, done: false });
+  }
+}
+
+function sdkToolCallId(extra: unknown): string | undefined {
+  if (!extra || typeof extra !== "object" || Array.isArray(extra)) return undefined;
+  const record = extra as Record<string, unknown>;
+  for (const value of [
+    record.toolUseId,
+    record.tool_use_id,
+    record.requestId,
+    record.request_id,
+  ]) {
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return undefined;
+}
+
+interface SdkTransportGuard {
+  promise: Promise<Error>;
+  cleanup: () => void;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object";
+}
+
+function sdkToolResultContent(block: { text?: string; content?: unknown }): string {
+  if (typeof block.content === "string") return block.content;
+  if (block.content !== undefined) return JSON.stringify(block.content);
+  return block.text ?? "";
+}
+
+function isClaudeSdkTransportError(err: unknown): err is Error {
+  if (!(err instanceof Error)) return false;
+  const code = isRecord(err) && typeof err.code === "string" ? err.code : "";
+  if (!["EPIPE", "ECONNRESET", "ERR_STREAM_DESTROYED"].includes(code)) return false;
+  const stack = err.stack ?? "";
+  return stack.includes("@anthropic-ai/claude-agent-sdk")
+    || stack.includes("ProcessTransport.write")
+    || stack.includes("Query.handleControlRequest");
+}
+
+function createSdkTransportGuard(abortController: AbortController | null): SdkTransportGuard {
+  let captured = false;
+  let settle: (err: Error) => void = () => {};
+  const promise = new Promise<Error>((resolve) => {
+    settle = resolve;
+  });
+  const cleanup = (): void => {
+    process.off("uncaughtException", onUncaughtException);
+  };
+  const onUncaughtException = (err: Error): void => {
+    if (!isClaudeSdkTransportError(err)) {
+      cleanup();
+      setImmediate(() => { throw err; });
+      return;
+    }
+    if (captured) return;
+    captured = true;
+    abortController?.abort();
+    settle(err);
+  };
+  process.on("uncaughtException", onUncaughtException);
+  return { promise, cleanup };
+}
+
+export class ClaudeSdkAdapter implements AgentClient {
+  private readonly model: string;
+  private readonly thinkingBudget: number;
+  private readonly maxTurns: number | null;
+  private readonly maxTurnsSource: "unset" | "env";
+  private readonly queryTimeoutMs: number;
+
+  constructor() {
+    this.model = process.env.CLAUDE_MODEL ?? "claude-sonnet-4-20250514";
+    this.thinkingBudget = Number(process.env.CLAUDE_THINKING_BUDGET ?? 16000);
+    const configuredMaxTurns = Number(process.env.CLAUDE_MAX_TURNS ?? 0);
+    this.maxTurns = Number.isFinite(configuredMaxTurns) && configuredMaxTurns > 0
+      ? Math.floor(configuredMaxTurns)
+      : null;
+    this.maxTurnsSource = this.maxTurns === null ? "unset" : "env";
+    this.queryTimeoutMs = Number(process.env.CLAUDE_SDK_QUERY_TIMEOUT_MS ?? 0);
+  }
+
+  async *run(
+    prompt: string,
+    tools: DagToolDefinition[],
+    context: AgentRunContext,
+  ): AsyncIterable<AgentEvent> {
+    if (context.protocol && context.protocol !== "anthropic_compatible") {
+      yield {
+        type: "error",
+        message: `Claude SDK requires an Anthropic-compatible endpoint; received protocol ${context.protocol}. Configure an Anthropic base URL or use the Kimi Code harness for Kimi.`,
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    const inputQueue = new ClaudeSdkUserMessageQueue(prompt);
+    let sdkAbortController: AbortController | null = null;
+    let controllerStopped = false;
+    const controllerBinding = context.turnController?.bindDriver({
+      steer: (command) => inputQueue.enqueue(command.content),
+      interrupt: (reason) => {
+        controllerStopped = true;
+        inputQueue.close(new Error(`Claude SDK turn interrupted: ${reason}`));
+        sdkAbortController?.abort();
+      },
+      close: () => {
+        controllerStopped = true;
+        inputQueue.close();
+        sdkAbortController?.abort();
+      },
+    });
+    if (controllerBinding?.status === "rejected") {
+      inputQueue.close(new Error(controllerBinding.reason ?? "Claude SDK turn controller binding failed"));
+      yield {
+        type: "error",
+        message: `Claude SDK turn controller binding failed: ${controllerBinding.reason ?? "unknown error"}`,
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    const sdk = await this.loadSdk().catch((err) => {
+      return { error: err instanceof Error ? err.message : String(err) };
+    });
+
+    if ("error" in sdk) {
+      inputQueue.close(new Error(`Claude Agent SDK not available: ${sdk.error}`));
+      yield {
+        type: "error",
+        message: `Claude Agent SDK not available: ${sdk.error}. Install @anthropic-ai/claude-agent-sdk.`,
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    let timeout: NodeJS.Timeout | null = null;
+    let stderrTail = "";
+    let externalAbortHandler: (() => void) | null = null;
+    let skillRuntime: ClaudeSkillProjectionRuntime | undefined;
+    let handoffStopRequested = false;
+    let resolveHandoffStop: (() => void) | null = null;
+    const handoffStop = new Promise<typeof HANDOFF_STOP>((resolve) => {
+      resolveHandoffStop = () => resolve(HANDOFF_STOP);
+    });
+    const appendStderr = (chunk: string): void => {
+      stderrTail = `${stderrTail}${chunk}`.slice(-4000);
+    };
+    // Declared outside try so the final `done` yield (after finally) can
+    // read them even when the query loop never ran (e.g. early SDK error).
+    const accumulatedUsage: AgentUsage = {};
+    let finalFinishReason: string | null = null;
+    let finalOutputTokenLimit: number | null = null;
+    const assistantUsageByMessageId = new Map<string, AgentUsage>();
+    let finalDurationMs: number | undefined;
+    let finalNumTurns: number | undefined;
+    let messageCount = 0;
+    let suppressedThinkingTokenDebugCount = 0;
+    let pendingThinkingTokenDebugCount = 0;
+    let rawTraceTerminalWritten = false;
+    const rawTraceConfigured = context.rawTraceSink !== undefined;
+    let rawTraceSink = context.rawTraceSink;
+    let rawTraceRecordsWritten = 0;
+    let rawTraceWriteFailures = 0;
+    let rawTraceLastError: string | null = null;
+    const writeRawTrace = async (record: Record<string, unknown>): Promise<string | null> => {
+      if (!rawTraceSink) return null;
+      try {
+        await rawTraceSink.write(record);
+        rawTraceRecordsWritten += 1;
+        return null;
+      } catch (error) {
+        rawTraceWriteFailures += 1;
+        rawTraceLastError = error instanceof Error ? error.message : String(error);
+        // Do not retry every provider event after a local trace failure. The
+        // final aggregate reports that the trace is incomplete while the
+        // model and Manager control plane remain available.
+        rawTraceSink = undefined;
+        return rawTraceLastError;
+      }
+    };
+    try {
+      const effectiveModel = context.model || this.model;
+      const authEnv = this.buildClaudeEnv(context, effectiveModel);
+      const requestedBuiltinTools = context.allowedBuiltinTools ?? AGENT_BUILTIN_TOOL_NAMES;
+      const supportedBuiltinTools = new Set<string>(AGENT_BUILTIN_TOOL_NAMES);
+      const builtinTools = context.handoffOnly
+        ? []
+        : requestedBuiltinTools.filter((tool) => supportedBuiltinTools.has(tool));
+      const permissionMode = context.claudePermissionMode ?? "bypassPermissions";
+      const allowedTools = [
+        ...builtinTools,
+        ...(permissionMode === "dontAsk" && tools.length > 0
+          ? tools.map((tool) => `mcp__${DAG_TOOLS_MCP_SERVER_NAME}__${tool.name}`)
+          : []),
+      ];
+      const effectiveThinkingBudget = context.handoffOnly
+        ? Math.min(this.thinkingBudget, HANDOFF_ONLY_THINKING_BUDGET)
+        : this.thinkingBudget;
+      const systemPromptMode = context.systemPromptMode ?? "append";
+      const workspaceReadToolHook = context.workspace && context.workspaceAccess
+        ? createWorkspaceReadToolHook(context.workspace, context.workspaceAccess)
+        : undefined;
+      const builtinToolBudgetHook = context.maxBuiltinToolCalls !== undefined
+        ? createBuiltinToolBudgetHook(context.maxBuiltinToolCalls)
+        : undefined;
+      const preToolUseHook = workspaceReadToolHook || builtinToolBudgetHook
+        ? async (...args: Parameters<NonNullable<typeof workspaceReadToolHook>>) => {
+            if (builtinToolBudgetHook) {
+              const budgetResult = await builtinToolBudgetHook(...args);
+              const permissionDecision = (budgetResult as {
+                hookSpecificOutput?: { permissionDecision?: string };
+              }).hookSpecificOutput?.permissionDecision;
+              if (permissionDecision === "deny") return budgetResult;
+            }
+            return workspaceReadToolHook ? workspaceReadToolHook(...args) : { continue: true };
+          }
+        : undefined;
+      skillRuntime = prepareClaudeSkillProjection(context);
+      const options: Record<string, unknown> = {
+        model: effectiveModel,
+        maxThinkingTokens: effectiveThinkingBudget,
+        tools: builtinTools,
+        allowedTools,
+        permissionMode,
+        ...(permissionMode === "bypassPermissions"
+          ? { allowDangerouslySkipPermissions: true }
+          : {}),
+        cwd: context.workspace ?? process.cwd(),
+        stderr: (data: string) => appendStderr(data),
+        env: skillRuntime
+          ? { ...authEnv.env, CLAUDE_CONFIG_DIR: skillRuntime.configDir }
+          : authEnv.env,
+        settingSources: skillRuntime?.skillCount ? ["user"] : [],
+        skills: skillRuntime?.skillCount ? "all" : [],
+        strictMcpConfig: true,
+        ...(preToolUseHook
+          ? { hooks: { PreToolUse: [{ hooks: [preToolUseHook] }] } }
+          : {}),
+      };
+      const nativeSessionId = persistentClaudeSessionId(context);
+      if (nativeSessionId) {
+        if (context.resumeSession) options.resume = nativeSessionId;
+        else options.sessionId = nativeSessionId;
+      }
+      if (this.maxTurns !== null) {
+        options.maxTurns = this.maxTurns;
+      }
+      const abortController = new AbortController();
+      sdkAbortController = abortController;
+      options.abortController = abortController;
+      if (controllerStopped) abortController.abort();
+      if (context.abortSignal) {
+        externalAbortHandler = () => {
+          inputQueue.close(new Error("Claude SDK turn aborted"));
+          abortController.abort();
+        };
+        if (context.abortSignal.aborted) {
+          externalAbortHandler();
+        } else {
+          context.abortSignal.addEventListener("abort", externalAbortHandler, { once: true });
+        }
+      }
+
+      if (context.systemPrompt) {
+        options.systemPrompt = systemPromptMode === "replace"
+          ? context.systemPrompt
+          : {
+              type: "preset",
+              preset: "claude_code",
+              append: context.systemPrompt,
+            };
+      }
+
+      // Register DAG tools as an in-process MCP server
+      if (tools.length > 0 && sdk.createSdkMcpServer && sdk.tool) {
+        const sdkTools = tools.map((t) =>
+          sdk.tool(t.name, t.description, jsonSchemaObjectToZodRawShape(t.input_schema), async (args, extra) => {
+            const toolCallId = sdkToolCallId(extra);
+            const normalizedArgs = normalizeJsonObjectStringsBySchema(args, t.input_schema);
+            const res = await t.handler(
+              normalizedArgs as Record<string, unknown>,
+              toolCallId ? { tool_call_id: toolCallId } : undefined,
+            );
+            if (t.name === "handoff" && res.is_error !== true) {
+              handoffStopRequested = true;
+              inputQueue.close();
+              // Return the MCP result before closing a provider stream that may
+              // otherwise wait forever after a successful terminal handoff.
+              setImmediate(() => resolveHandoffStop?.());
+            }
+            return {
+              content: [{ type: "text" as const, text: res.content.map((c) => c.text).join("") }],
+              isError: res.is_error,
+            };
+          }),
+        );
+        const mcpServer = sdk.createSdkMcpServer({
+          name: DAG_TOOLS_MCP_SERVER_NAME,
+          version: WORKER_RUNTIME_VERSION,
+          tools: sdkTools,
+        });
+        options.mcpServers = { [DAG_TOOLS_MCP_SERVER_NAME]: mcpServer };
+        yield {
+          type: "debug",
+          source: "claude-sdk",
+          message: "mcp_server_registered",
+          data: { server: DAG_TOOLS_MCP_SERVER_NAME, tool_names: tools.map((tool) => tool.name) },
+        };
+      } else {
+        yield {
+          type: "debug",
+          source: "claude-sdk",
+          message: "mcp_server_not_registered",
+          data: { tool_count: tools.length },
+        };
+      }
+
+      const rawTraceStartError = await writeRawTrace({
+        record_type: "query_start",
+        prompt,
+        system_prompt: context.systemPrompt ?? null,
+        system_prompt_mode: systemPromptMode,
+        model: effectiveModel,
+        thinking_budget: effectiveThinkingBudget,
+        builtin_tools: builtinTools,
+        dag_tool_names: tools.map((tool) => tool.name),
+        session_id: context.sessionId ?? null,
+      });
+      if (rawTraceStartError) {
+        yield {
+          type: "debug",
+          source: "claude-sdk",
+          message: "raw_trace_write_failed",
+          data: { error: rawTraceStartError },
+        };
+      }
+
+      yield {
+        type: "debug",
+        source: "claude-sdk",
+        message: "query_start",
+        data: {
+          model: effectiveModel,
+          max_turns: this.maxTurns,
+          max_turns_source: this.maxTurnsSource,
+          thinking_budget: effectiveThinkingBudget,
+          cwd: options.cwd,
+          has_system_prompt: Boolean(context.systemPrompt),
+          system_prompt_mode: systemPromptMode,
+          tool_count: tools.length,
+          auth_env: authEnv.authEnv,
+          auth_source: authEnv.authSource,
+          base_url_env: authEnv.baseUrlEnv,
+          base_url_source: authEnv.baseUrlSource,
+          timeout_ms: this.queryTimeoutMs > 0 ? this.queryTimeoutMs : null,
+          external_abort_signal: Boolean(context.abortSignal),
+          builtin_tools: builtinTools,
+          allowed_tools: allowedTools,
+          permission_mode: permissionMode,
+          projected_skill_count: skillRuntime?.skillCount ?? 0,
+          handoff_only: context.handoffOnly === true,
+        },
+      };
+
+      if (this.queryTimeoutMs > 0) {
+        timeout = setTimeout(() => {
+          inputQueue.close(new Error(`Claude SDK query timed out after ${this.queryTimeoutMs}ms`));
+          abortController.abort();
+        }, this.queryTimeoutMs);
+      }
+
+      const query = sdk.query({ prompt: inputQueue, options });
+      const transportGuard = createSdkTransportGuard(abortController);
+      try {
+        const iterator = query[Symbol.asyncIterator]();
+        while (true) {
+          const next = await Promise.race([
+            iterator.next(),
+            handoffStop,
+            transportGuard.promise.then((err) => {
+              throw err;
+            }),
+          ]);
+          if (next === HANDOFF_STOP) {
+            inputQueue.close();
+            abortController.abort();
+            yield {
+              type: "debug",
+              source: "claude-sdk",
+              message: "query_stopped_after_handoff",
+              data: {
+                stderr_tail: stderrTail.trim().slice(-2000) || null,
+              },
+            };
+            break;
+          }
+          if (next.done) {
+            inputQueue.close();
+            break;
+          }
+          const msg = next.value;
+          if (msg.type === "result") inputQueue.close();
+          messageCount += 1;
+          const stopReason = msg.message?.stop_reason;
+          if (typeof stopReason === "string" && stopReason.trim()) {
+            finalFinishReason = stopReason.trim().slice(0, 128);
+          }
+          const usageLimitSource = msg.message?.usage ?? msg.usage;
+          for (const alias of [
+            "output_token_limit",
+            "max_output_tokens",
+            "output_tokens_limit",
+            "max_tokens",
+          ] as const) {
+            const candidate = usageLimitSource?.[alias];
+            if (typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0) {
+              finalOutputTokenLimit = Math.floor(candidate);
+              break;
+            }
+          }
+          const rawTraceMessageError = await writeRawTrace({
+            record_type: "sdk_message",
+            sequence: messageCount,
+            message: msg as unknown as Record<string, unknown>,
+          });
+          if (rawTraceMessageError) {
+            yield {
+              type: "debug",
+              source: "claude-sdk",
+              message: "raw_trace_write_failed",
+              data: { sequence: messageCount, error: rawTraceMessageError },
+            };
+          }
+          const stderrChunk = stderrTail.trim();
+          if (stderrChunk) {
+            yield {
+              type: "debug",
+              source: "claude-sdk",
+              message: "claude_code_stderr",
+              data: { sequence: messageCount, tail: stderrChunk.slice(-2000) },
+            };
+            stderrTail = "";
+          }
+          // Extract usage from this message. Claude-compatible providers can
+          // repeat one assistant message id for thinking, text, and tool-use
+          // snapshots. Treat those as replacements for the same turn rather
+          // than independent deltas. The result message carries an aggregate
+          // we prefer when present.
+          const msgUsage = msg.message?.usage ?? msg.usage;
+          let usageChanged = false;
+          if (msgUsage) {
+            if (msg.type === "result") {
+              // Result message carries the authoritative aggregate — replace.
+              for (const key of AGENT_USAGE_KEYS) {
+                const value = msgUsage[key];
+                if (value !== undefined && value !== accumulatedUsage[key]) {
+                  accumulatedUsage[key] = value;
+                  usageChanged = true;
+                }
+              }
+              finalDurationMs = msg.duration_ms;
+              finalNumTurns = msg.num_turns;
+            } else {
+              const messageId = msg.message?.id?.trim();
+              if (messageId) {
+                const previous = assistantUsageByMessageId.get(messageId);
+                const next: AgentUsage = { ...previous };
+                for (const key of AGENT_USAGE_KEYS) {
+                  if (msgUsage[key] !== undefined) next[key] = msgUsage[key];
+                }
+                for (const key of AGENT_USAGE_KEYS) {
+                  if (previous?.[key] === next[key]) continue;
+                  accumulatedUsage[key] = (accumulatedUsage[key] ?? 0)
+                    - (previous?.[key] ?? 0)
+                    + (next[key] ?? 0);
+                  usageChanged = true;
+                }
+                assistantUsageByMessageId.set(messageId, next);
+              } else {
+                // Providers without stable message ids still expose per-turn
+                // deltas, so preserve the existing additive fallback.
+                for (const key of AGENT_USAGE_KEYS) {
+                  const value = msgUsage[key];
+                  if (value === undefined) continue;
+                  accumulatedUsage[key] = (accumulatedUsage[key] ?? 0) + value;
+                  usageChanged = true;
+                }
+              }
+            }
+          }
+          // Emit a usage event inline (carrying the running total) so the
+          // prompt-runner has up-to-date totals even when the agent yields
+          // early via handoff and the outer loop breaks before we reach the
+          // post-loop aggregate emission below.
+          if (usageChanged) {
+            yield {
+              type: "usage",
+              usage: { ...accumulatedUsage },
+              finish_reason: finalFinishReason,
+              output_token_limit: finalOutputTokenLimit,
+            };
+          }
+          if (this.shouldEmitSdkMessageDebug(msg)) {
+            if (pendingThinkingTokenDebugCount > 0) {
+              yield {
+                type: "debug",
+                source: "claude-sdk",
+                message: "thinking_tokens_aggregated",
+                data: {
+                  count: pendingThinkingTokenDebugCount,
+                  total: suppressedThinkingTokenDebugCount,
+                  through_sequence: messageCount - 1,
+                },
+              };
+              pendingThinkingTokenDebugCount = 0;
+            }
+            yield this.debugMessageEvent(msg, messageCount);
+          } else {
+            suppressedThinkingTokenDebugCount += 1;
+            pendingThinkingTokenDebugCount += 1;
+          }
+          const events = this.mapSdkMessage(msg);
+          for (const event of events) yield event;
+        }
+      } finally {
+        transportGuard.cleanup();
+      }
+      // Emit a usage event so the prompt-runner can forward totals even
+      // when the run ends without a handoff (e.g. error path).
+      const hasUsage = accumulatedUsage.input_tokens !== undefined
+        || accumulatedUsage.output_tokens !== undefined
+        || accumulatedUsage.cache_read_input_tokens !== undefined
+        || accumulatedUsage.cache_creation_input_tokens !== undefined;
+      if (hasUsage) {
+        yield {
+          type: "usage",
+          usage: accumulatedUsage,
+          finish_reason: finalFinishReason,
+          output_token_limit: finalOutputTokenLimit,
+        };
+      }
+      if (pendingThinkingTokenDebugCount > 0) {
+        yield {
+          type: "debug",
+          source: "claude-sdk",
+          message: "thinking_tokens_aggregated",
+          data: {
+            count: pendingThinkingTokenDebugCount,
+            total: suppressedThinkingTokenDebugCount,
+            through_sequence: messageCount,
+          },
+        };
+        pendingThinkingTokenDebugCount = 0;
+      }
+      rawTraceTerminalWritten = true;
+      const rawTraceEndError = await writeRawTrace({
+        record_type: "query_end",
+        termination: "completed",
+        message_count: messageCount,
+        suppressed_thinking_token_debug_count: suppressedThinkingTokenDebugCount,
+        usage: hasUsage ? accumulatedUsage : null,
+        finish_reason: finalFinishReason,
+        output_token_limit: finalOutputTokenLimit,
+        duration_ms: finalDurationMs ?? null,
+        num_turns: finalNumTurns ?? null,
+      });
+      if (rawTraceEndError) {
+        yield {
+          type: "debug",
+          source: "claude-sdk",
+          message: "raw_trace_write_failed",
+          data: { error: rawTraceEndError },
+        };
+      }
+      yield {
+        type: "debug",
+        source: "claude-sdk",
+        message: "query_done",
+        data: {
+          message_count: messageCount,
+          suppressed_thinking_token_debug_count: suppressedThinkingTokenDebugCount,
+          stderr_tail: stderrTail.trim().slice(-2000) || null,
+          usage: hasUsage ? accumulatedUsage : null,
+          finish_reason: finalFinishReason,
+          output_token_limit: finalOutputTokenLimit,
+          duration_ms: finalDurationMs ?? null,
+          num_turns: finalNumTurns ?? null,
+          raw_trace_configured: rawTraceConfigured,
+          raw_trace_records_written: rawTraceRecordsWritten,
+          raw_trace_write_failures: rawTraceWriteFailures,
+          raw_trace_last_error: rawTraceLastError,
+        },
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      rawTraceTerminalWritten = true;
+      await writeRawTrace({
+        record_type: "query_error",
+        error: msg,
+        stderr_tail: stderrTail.trim().slice(-2000) || null,
+      });
+      inputQueue.close(err instanceof Error ? err : new Error(msg));
+      if (handoffStopRequested) {
+        yield {
+          type: "debug",
+          source: "claude-sdk",
+          message: "query_stopped_after_handoff",
+          data: {
+            stderr_tail: stderrTail.trim().slice(-2000) || null,
+          },
+        };
+      } else {
+        yield {
+          type: "debug",
+          source: "claude-sdk",
+          message: "query_error",
+          data: {
+            error: msg,
+            stderr_tail: stderrTail.trim().slice(-2000) || null,
+            timeout_configured_ms: this.queryTimeoutMs > 0 ? this.queryTimeoutMs : null,
+          },
+        };
+        if (isClaudeSdkTransportError(err)) {
+          yield { type: "error", message: `Claude SDK transport error: ${msg}` };
+        } else if (msg.includes("429") || msg.includes("rate")) {
+          yield { type: "error", message: `Rate limited: ${msg}` };
+        } else if (msg.includes("401") || msg.includes("403")) {
+          yield { type: "error", message: `Auth failure: ${msg}` };
+        } else {
+          yield { type: "error", message: `Claude SDK error: ${msg}` };
+        }
+      }
+    } finally {
+      if (!rawTraceTerminalWritten) {
+        const hasUsage = accumulatedUsage.input_tokens !== undefined
+          || accumulatedUsage.output_tokens !== undefined
+          || accumulatedUsage.cache_read_input_tokens !== undefined
+          || accumulatedUsage.cache_creation_input_tokens !== undefined;
+        await writeRawTrace({
+          record_type: "query_end",
+          termination: "consumer_closed",
+          message_count: messageCount,
+          suppressed_thinking_token_debug_count: suppressedThinkingTokenDebugCount,
+          usage: hasUsage ? accumulatedUsage : null,
+          finish_reason: finalFinishReason,
+          output_token_limit: finalOutputTokenLimit,
+          duration_ms: finalDurationMs ?? null,
+          num_turns: finalNumTurns ?? null,
+        });
+      }
+      inputQueue.close();
+      if (timeout) clearTimeout(timeout);
+      if (context.abortSignal && externalAbortHandler) {
+        context.abortSignal.removeEventListener("abort", externalAbortHandler);
+      }
+      sdkAbortController = null;
+      skillRuntime?.cleanup();
+      skillRuntime = undefined;
+    }
+
+    yield {
+      type: "done",
+      usage: (accumulatedUsage.input_tokens !== undefined
+        || accumulatedUsage.output_tokens !== undefined
+        || accumulatedUsage.cache_read_input_tokens !== undefined
+        || accumulatedUsage.cache_creation_input_tokens !== undefined)
+        ? accumulatedUsage
+        : undefined,
+      duration_ms: finalDurationMs,
+      num_turns: finalNumTurns,
+      finish_reason: finalFinishReason,
+      output_token_limit: finalOutputTokenLimit,
+    };
+  }
+
+  private debugMessageEvent(msg: SdkMessage, sequence: number): AgentEvent {
+    const blocks = msg.message?.content ?? [];
+    // Diagnostic: surface the raw usage location so we can confirm where
+    // the SDK exposes token usage on each message type.
+    const rawMsgUsage = (msg as { message?: { usage?: unknown } }).message?.usage;
+    const rawTopUsage = (msg as { usage?: unknown }).usage;
+    return {
+      type: "debug",
+      source: "claude-sdk",
+      message: "sdk_message",
+      data: {
+        sequence,
+        type: msg.type,
+        subtype: msg.subtype ?? null,
+        event_type: msg.event?.type ?? null,
+        stop_reason: msg.message?.stop_reason ?? null,
+        content_block_types: blocks.map((block) => block.type),
+        tool_names: blocks
+          .filter((block) => block.type === "tool_use" && block.name)
+          .map((block) => block.name as string),
+        result_preview: typeof msg.result === "string" ? msg.result.slice(0, 500) : null,
+        error: msg.error ?? null,
+        errors: msg.errors ?? [],
+        duration_ms: msg.duration_ms ?? null,
+        num_turns: msg.num_turns ?? null,
+        permission_denial_count: msg.permission_denials?.length ?? 0,
+        is_error: msg.is_error ?? false,
+        raw_message_usage: rawMsgUsage ?? null,
+        raw_top_usage: rawTopUsage ?? null,
+      },
+    };
+  }
+
+  private shouldEmitSdkMessageDebug(msg: SdkMessage): boolean {
+    // Some Anthropic-compatible endpoints emit one system message for every
+    // thinking-token update. Persisting those otherwise-empty diagnostics can
+    // generate thousands of websocket events and starve Manager status and
+    // cancellation requests. Usage is handled separately above, so suppress
+    // only successful, token-only progress messages while retaining errors,
+    // text, tools, results, and the final aggregate query_done diagnostic.
+    return !(
+      msg.type === "system"
+      && msg.subtype === "thinking_tokens"
+      && !msg.error
+      && (msg.errors?.length ?? 0) === 0
+      && msg.is_error !== true
+    );
+  }
+
+  private buildClaudeEnv(context: AgentRunContext, effectiveModel: string): {
+    env: Record<string, string | undefined>;
+    authEnv: boolean;
+    authSource: string;
+    baseUrlEnv: boolean;
+    baseUrlSource: string;
+  } {
+    const fromContext = context.apiKey.trim();
+    const fromAnthropicEnv = process.env.ANTHROPIC_API_KEY ?? "";
+    const fromLlmEnv = process.env.LLM_API_KEY ?? "";
+    const apiKey = fromContext || fromAnthropicEnv || fromLlmEnv;
+    const fromContextBaseUrl = context.baseUrl.trim();
+    const fromAnthropicBaseUrl = process.env.ANTHROPIC_BASE_URL ?? "";
+    const fromLlmBaseUrl = process.env.LLM_BASE_URL ?? "";
+    const baseUrl = fromContextBaseUrl || fromAnthropicBaseUrl || fromLlmBaseUrl;
+    const env = sanitizedAgentChildEnv({
+      ...process.env,
+      ...context.environmentVariables,
+    });
+    if (apiKey) {
+      if (context.anthropicAuthMode === "auth_token") {
+        delete env.ANTHROPIC_API_KEY;
+        env.ANTHROPIC_AUTH_TOKEN = apiKey;
+      } else {
+        delete env.ANTHROPIC_AUTH_TOKEN;
+        env.ANTHROPIC_API_KEY = apiKey;
+      }
+    }
+    if (baseUrl) {
+      env.ANTHROPIC_BASE_URL = baseUrl;
+      env.LLM_BASE_URL = baseUrl;
+    }
+    // Pin Claude Code's internal/background model selection to the effective
+    // model. Atms only targets gateway providers (e.g. qwen3.6) — Claude
+    // Code's defaults (claude-haiku-*) are not valid model ids on those
+    // gateways and would 404. ANTHROPIC_SMALL_FAST_MODEL is read by SDK
+    // 0.1.77 and falls back to ANTHROPIC_DEFAULT_HAIKU_MODEL; set both so a
+    // future SDK bump cannot reintroduce the haiku default. The telemetry /
+    // nonessential-traffic flags suppress /api/event_logging/batch and similar
+    // requests that don't exist on the gateway.
+    env.ANTHROPIC_MODEL = effectiveModel;
+    env.ANTHROPIC_DEFAULT_HAIKU_MODEL = effectiveModel;
+    env.ANTHROPIC_SMALL_FAST_MODEL = effectiveModel;
+    env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+    env.DISABLE_TELEMETRY = "1";
+    env.DISABLE_ERROR_REPORTING = "1";
+    return {
+      env,
+      authEnv: Boolean(apiKey),
+      authSource: fromContext
+        ? "context.apiKey"
+        : fromAnthropicEnv
+          ? "ANTHROPIC_API_KEY"
+          : fromLlmEnv
+            ? "LLM_API_KEY"
+            : "missing",
+      baseUrlEnv: Boolean(baseUrl),
+      baseUrlSource: fromContextBaseUrl
+        ? "context.baseUrl"
+        : fromAnthropicBaseUrl
+          ? "ANTHROPIC_BASE_URL"
+          : fromLlmBaseUrl
+            ? "LLM_BASE_URL"
+            : "missing",
+    };
+  }
+
+  private mapSdkMessage(msg: SdkMessage): AgentEvent[] {
+    const events: AgentEvent[] = [];
+
+    switch (msg.type) {
+      case "assistant": {
+        // Claude Agent SDK preserves one model response as one AssistantMessage.
+        // Text in a response that also requests a tool is an authored progress
+        // update; text in an end-turn response is the authored final answer.
+        // Keep that boundary instead of flattening every response into one final.
+        const blocks = msg.message?.content ?? [];
+        const text = blocks
+          .filter((block) => block.type === "text" && block.text)
+          .map((block) => block.text as string)
+          .join("");
+        const hasToolUse = blocks.some((block) => block.type === "tool_use")
+          || msg.message?.stop_reason === "tool_use";
+        let textEmitted = false;
+        for (const block of blocks) {
+          if (block.type === "text" && text && !textEmitted) {
+            events.push(hasToolUse
+              ? { type: "progress", text }
+              : { type: "text", text });
+            textEmitted = true;
+          } else if (block.type === "thinking" && block.thinking) {
+            events.push({ type: "thinking", text: block.thinking });
+          } else if (block.type === "tool_use") {
+            events.push({
+              type: "tool_use",
+              id: block.id ?? "",
+              name: block.name ?? "",
+              input: block.input ?? {},
+            });
+          } else if (block.type === "tool_result") {
+            events.push({
+              type: "tool_result",
+              tool_use_id: block.tool_use_id ?? block.id ?? "",
+              content: sdkToolResultContent(block),
+              is_error: block.is_error,
+            });
+          }
+        }
+        break;
+      }
+      case "user": {
+        for (const block of msg.message?.content ?? []) {
+          if (block.type !== "tool_result") continue;
+          events.push({
+            type: "tool_result",
+            tool_use_id: block.tool_use_id ?? block.id ?? "",
+            content: sdkToolResultContent(block),
+            is_error: block.is_error,
+          });
+        }
+        break;
+      }
+      case "stream_event": {
+        // Partial/streaming event
+        const cb = msg.event?.content_block;
+        if (cb) {
+          if (cb.type === "text" && cb.text) {
+            events.push({ type: "text", text: cb.text });
+          } else if (cb.type === "thinking" && cb.thinking) {
+            events.push({ type: "thinking", text: cb.thinking });
+          }
+        }
+        if (msg.event?.type === "content_block_stop") {
+          events.push({ type: "turn_complete" });
+        }
+        break;
+      }
+      case "result": {
+        const resultError = msg.error || msg.errors?.join("; ") || "";
+        const failedSubtype = msg.subtype && msg.subtype !== "success" ? msg.subtype : "";
+        if (msg.is_error || resultError || failedSubtype) {
+          const detail = resultError || failedSubtype || "unknown result error";
+          events.push({ type: "error", message: `Claude SDK result failed: ${detail}` });
+        }
+        break;
+      }
+    }
+
+    return events;
+  }
+
+  private async loadSdk(): Promise<SdkModule> {
+    try {
+      const mod = await import("@anthropic-ai/claude-agent-sdk");
+      return mod as unknown as SdkModule;
+    } catch {
+      throw new Error(
+        "@anthropic-ai/claude-agent-sdk is not installed. " +
+        "Run: npm install @anthropic-ai/claude-agent-sdk",
+      );
+    }
+  }
+
+  async resume(sessionId: string): Promise<AgentRunContext | null> {
+    throw new Error(
+      `Claude SDK transcript resume is not implemented for session ${sessionId}; ` +
+      "use DAG checkpoint resume so the resume instruction is injected into the next worker prompt.",
+    );
+  }
+}

@@ -1,0 +1,930 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createApp, defineComponent, h, nextTick, ref, type App } from 'vue'
+import { i18n } from '@/plugins/i18n'
+import type { LLMSetting } from '@/api/services/llm-settings-api'
+import type { Provider } from '@/api/types/orchestration-v2.types'
+import { agentSettingsApi } from '@/api/agent'
+import { probeModels } from '@/api/services/providers-api'
+import { testVoiceEndpoints } from '@/api/services/voice-api'
+import CustomProviderManager from './CustomProviderManager.vue'
+import EditModelForm, { type EditModelPayload } from './EditModelForm.vue'
+import ModelForm, { type ModelFormPayload } from './ModelForm.vue'
+
+vi.mock('@/api/services/providers-api', () => ({
+  probeModels: vi.fn(async () => ({ models: [] }))
+}))
+
+vi.mock('@/api/services/voice-api', () => ({
+  testVoiceEndpoints: vi.fn(async (endpoints: Array<{ id: string; kind: string; url: string }>) => ({
+    success: true,
+    data: {
+      ok: true,
+      results: endpoints.map(endpoint => ({
+        ...endpoint,
+        ok: true,
+        reachable: true,
+        status_code: endpoint.kind === 'http' ? 400 : undefined,
+        message: 'reachable'
+      }))
+    }
+  }))
+}))
+
+vi.mock('@/api/agent', () => ({
+  agentSettingsApi: {
+    createProvider: vi.fn(async () => ({ success: true })),
+    deleteProvider: vi.fn(async () => ({ success: true })),
+    updateProvider: vi.fn(async () => ({ success: true }))
+  }
+}))
+
+vi.mock('@/components/controls/useToast', () => ({
+  useToast: () => ({ showToast: vi.fn() })
+}))
+
+const provider: Provider = {
+  id: 'mixed-provider',
+  name: 'Mixed Provider',
+  source: 'builtin',
+  readonly: true,
+  endpoints: [
+    {
+      id: 'mixed-api',
+      provider_id: 'mixed-provider',
+      name: 'Mixed API',
+      plan_type: 'api_billing',
+      protocol: 'openai_compatible',
+      auth_type: 'bearer',
+      base_url: 'https://mixed.example/v1',
+      default_model: 'chat-model',
+      supports_llm: true,
+      supports_asr: true,
+      models: [
+        { id: 'chat-model', display_name: 'Chat Model', supports_llm: true },
+        {
+          id: 'speech-model',
+          display_name: 'Speech Model',
+          supports_llm: false,
+          supports_asr: true
+        }
+      ]
+    }
+  ]
+}
+
+const setting: LLMSetting = {
+  id: 'setting-1',
+  provider_id: provider.id,
+  provider_name: provider.name,
+  provider_source: 'builtin',
+  provider_readonly: true,
+  endpoint_id: 'mixed-api',
+  endpoint_name: 'Mixed API',
+  plan_type: 'api_billing',
+  protocol: 'openai_compatible',
+  model_name: 'chat-model',
+  display_name: 'Chat Model',
+  api_key_display: '****',
+  supports_llm: true,
+  supports_asr: false,
+  supports_tts: false,
+  supports_audio_input: false,
+  supports_image_input: true,
+  supports_video_input: false,
+  is_active: true,
+  is_default: true,
+  created_at: '2026-01-01T00:00:00.000Z',
+  updated_at: '2026-01-01T00:00:00.000Z'
+}
+
+const customProvider: Provider = {
+  id: 'local-gemma4-omni',
+  name: 'Local Gemma4 12B Omni',
+  default_model: 'gemma4-12b',
+  base_url: 'http://127.0.0.1:9000/v1',
+  source: 'custom',
+  readonly: false,
+  endpoints: []
+}
+
+const customSetting: LLMSetting = {
+  ...setting,
+  id: 'gemma-setting',
+  provider_id: customProvider.id,
+  provider_name: customProvider.name,
+  provider_source: 'custom',
+  provider_readonly: false,
+  endpoint_id: 'local-gemma4-omni_custom',
+  endpoint_name: 'Custom endpoint',
+  plan_type: 'custom',
+  protocol: 'custom',
+  model_name: 'gemma4-12b',
+  display_name: 'Gemma4 12B Omni'
+}
+
+const asrProvider: Provider = {
+  id: 'local-asr',
+  name: 'Local ASR',
+  default_model: 'qwen3-asr-realtime',
+  base_url: 'http://192.168.100.10:5002',
+  source: 'custom',
+  readonly: false,
+  supports_llm: false,
+  supports_asr: true,
+  endpoints: []
+}
+
+const asrSetting: LLMSetting = {
+  ...customSetting,
+  id: 'asr-setting',
+  provider_id: asrProvider.id,
+  provider_name: asrProvider.name,
+  model_name: 'qwen3-asr-realtime',
+  display_name: 'qwen3-asr-realtime',
+  supports_llm: false,
+  supports_asr: true,
+  supports_audio_input: true,
+  supports_image_input: false
+}
+
+let app: App<Element> | null = null
+
+async function mount(component: object, props: Record<string, unknown>) {
+  const root = document.createElement('div')
+  document.body.appendChild(root)
+  app = createApp(component, props)
+  app.use(i18n)
+  app.mount(root)
+  await nextTick()
+  return root
+}
+
+beforeEach(() => {
+  i18n.global.locale.value = 'zh-Hans'
+  vi.clearAllMocks()
+})
+
+afterEach(() => {
+  app?.unmount()
+  app = null
+  document.body.innerHTML = ''
+})
+
+describe('model purpose forms', () => {
+  it('filters preset models and fixes primary capabilities from the ASR purpose', async () => {
+    let submitted: ModelFormPayload | undefined
+    const root = await mount(ModelForm, {
+      providers: [provider],
+      purpose: 'asr',
+      onSubmit: (payload: ModelFormPayload) => {
+        submitted = payload
+      }
+    })
+
+    const credential = Array.from(root.querySelectorAll('button')).find(button =>
+      button.textContent?.includes('API 计费')
+    )
+    expect(credential).toBeTruthy()
+    credential!.click()
+    await nextTick()
+
+    expect(root.textContent).toContain('Speech Model')
+    expect(root.textContent).not.toContain('Chat Model')
+    const speechModel = Array.from(root.querySelectorAll('button')).find(button =>
+      button.textContent?.includes('Speech Model')
+    )
+    speechModel!.click()
+    await nextTick()
+
+    const keyInput = root.querySelector<HTMLInputElement>('input[type="password"]')!
+    keyInput.value = 'asr-secret'
+    keyInput.dispatchEvent(new Event('input'))
+    await nextTick()
+
+    const submit = Array.from(root.querySelectorAll('button')).find(
+      button => button.textContent?.trim() === '添加'
+    )
+    submit!.click()
+    await nextTick()
+
+    expect(submitted?.modelName).toBe('speech-model')
+    expect(submitted?.capabilities).toMatchObject({
+      supports_llm: false,
+      supports_asr: true,
+      supports_tts: false
+    })
+  })
+
+  it('reuses a saved provider credential when adding another model on the same endpoint', async () => {
+    let submitted: ModelFormPayload | undefined
+    const providerWithAnotherModel: Provider = {
+      ...provider,
+      endpoints: provider.endpoints!.map(endpoint => ({
+        ...endpoint,
+        models: [
+          ...endpoint.models,
+          { id: 'second-chat-model', display_name: 'Second Chat Model', supports_llm: true }
+        ]
+      }))
+    }
+    const root = await mount(ModelForm, {
+      providers: [providerWithAnotherModel],
+      settings: [setting],
+      purpose: 'llm',
+      onSubmit: (payload: ModelFormPayload) => {
+        submitted = payload
+      }
+    })
+
+    const credential = Array.from(root.querySelectorAll('button')).find(button =>
+      button.textContent?.includes('API 计费')
+    )!
+    credential.click()
+    await nextTick()
+
+    expect(root.querySelector('[data-testid="reused-provider-credential"]')).toBeTruthy()
+    expect(root.querySelector('input[type="password"]')).toBeNull()
+
+    const model = Array.from(root.querySelectorAll('button')).find(button =>
+      button.textContent?.includes('Second Chat Model')
+    )!
+    model.click()
+    await nextTick()
+
+    const submit = Array.from(root.querySelectorAll('button')).find(
+      button => button.textContent?.trim() === '添加'
+    )!
+    submit.click()
+    await nextTick()
+
+    expect(submitted?.modelName).toBe('second-chat-model')
+    expect(submitted?.apiKey).toBe('')
+    expect(submitted?.reuseExistingApiKey).toBe(true)
+  })
+
+  it('probes new models by saved setting id when reusing a credential', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.mocked(probeModels).mockResolvedValueOnce({ models: ['chat-model', 'k3'] })
+      const root = await mount(ModelForm, {
+        providers: [provider],
+        settings: [setting],
+        purpose: 'llm'
+      })
+
+      const credential = Array.from(root.querySelectorAll('button')).find(button =>
+        button.textContent?.includes('API 计费')
+      )!
+      credential.click()
+      await nextTick()
+      await vi.advanceTimersByTimeAsync(600)
+      await nextTick()
+
+      expect(probeModels).toHaveBeenCalledWith({ settingId: setting.id })
+      expect(probeModels).not.toHaveBeenCalledWith(
+        expect.objectContaining({ apiKey: expect.anything() })
+      )
+      expect(root.textContent).toContain('k3')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('lists both K3 catalog variants once when provider probing returns the same model ids', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.mocked(probeModels).mockResolvedValueOnce({
+        models: ['k3', 'k3-256k', 'k3-experimental']
+      })
+      const k3Provider: Provider = {
+        ...provider,
+        id: 'kimi_cn',
+        name: 'Kimi / Moonshot CN',
+        endpoints: [{
+          ...provider.endpoints![0],
+          id: 'kimi_coding_plan',
+          provider_id: 'kimi_cn',
+          name: 'Kimi Coding Plan',
+          plan_type: 'coding_plan',
+          base_url: 'https://api.kimi.com/coding/v1',
+          default_model: 'kimi-for-coding',
+          models: [
+            { id: 'kimi-for-coding', display_name: 'Kimi K2.7 Code', supports_llm: true },
+            {
+              id: 'k3',
+              display_name: 'Kimi K3',
+              supports_llm: true,
+              supports_image_input: true,
+              supports_video_input: true,
+              reasoning_effort_map: { low: 'low', high: 'high', max: 'max' },
+              default_reasoning_effort: 'high'
+            },
+            {
+              id: 'k3-256k',
+              display_name: 'Kimi K3 256K',
+              supports_llm: true,
+              supports_image_input: true,
+              supports_video_input: false,
+              reasoning_effort_map: { low: 'low', high: 'high', max: 'max' },
+              default_reasoning_effort: 'high'
+            }
+          ]
+        }]
+      }
+      const k3Setting: LLMSetting = {
+        ...setting,
+        provider_id: k3Provider.id,
+        provider_name: k3Provider.name,
+        endpoint_id: 'kimi_coding_plan',
+        endpoint_name: 'Kimi Coding Plan',
+        plan_type: 'coding_plan',
+        model_name: 'kimi-for-coding',
+        display_name: 'Kimi K2.7 Code'
+      }
+      let submitted: ModelFormPayload | undefined
+      const root = await mount(ModelForm, {
+        providers: [k3Provider],
+        settings: [k3Setting],
+        purpose: 'llm',
+        onSubmit: (payload: ModelFormPayload) => {
+          submitted = payload
+        }
+      })
+
+      const credential = Array.from(root.querySelectorAll('button')).find(button =>
+        button.textContent?.includes('Coding Plan')
+      )!
+      credential.click()
+      await nextTick()
+      await vi.advanceTimersByTimeAsync(600)
+      await nextTick()
+
+      expect(probeModels).toHaveBeenCalledWith({ settingId: k3Setting.id })
+      const modelButton = (label: string) => Array.from(root.querySelectorAll('button')).filter(
+        button => button.querySelector('.block.truncate')?.textContent?.trim() === label
+      )
+      expect(modelButton('Kimi K3')).toHaveLength(1)
+      expect(modelButton('Kimi K3 256K')).toHaveLength(1)
+      expect(modelButton('k3-experimental')).toHaveLength(1)
+
+      modelButton('Kimi K3')[0].click()
+      await nextTick()
+      modelButton('Kimi K3 256K')[0].click()
+      await nextTick()
+      const submit = Array.from(root.querySelectorAll('button')).find(
+        button => button.textContent?.trim() === '添加'
+      )!
+      submit.click()
+      await nextTick()
+
+      expect(submitted?.models).toEqual(['k3', 'k3-256k'])
+      expect(submitted?.modelConfigs).toEqual([
+        expect.objectContaining({
+          modelName: 'k3',
+          capabilities: expect.objectContaining({
+            supports_image_input: true,
+            supports_video_input: true
+          })
+        }),
+        expect.objectContaining({
+          modelName: 'k3-256k',
+          capabilities: expect.objectContaining({
+            supports_image_input: true,
+            supports_video_input: false
+          })
+        })
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels a pending credential probe when the form unmounts', async () => {
+    vi.useFakeTimers()
+    try {
+      const root = await mount(ModelForm, {
+        providers: [provider],
+        purpose: 'asr'
+      })
+      const credential = Array.from(root.querySelectorAll('button')).find(button =>
+        button.textContent?.includes('API 计费')
+      )!
+      credential.click()
+      await nextTick()
+      const keyInput = root.querySelector<HTMLInputElement>('input[type="password"]')!
+      keyInput.value = 'pending-secret'
+      keyInput.dispatchEvent(new Event('input'))
+      await nextTick()
+
+      app?.unmount()
+      app = null
+      await vi.advanceTimersByTimeAsync(600)
+
+      expect(probeModels).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('uses a separate edit form with a read-only provider binding', async () => {
+    let submitted: EditModelPayload | undefined
+    const root = await mount(EditModelForm, {
+      setting,
+      onSubmit: (payload: EditModelPayload) => {
+        submitted = payload
+      }
+    })
+
+    expect(root.textContent).toContain('Mixed Provider')
+    expect(root.querySelectorAll('select')).toHaveLength(0)
+    expect(root.textContent).toContain('只读')
+
+    const save = Array.from(root.querySelectorAll('button')).find(
+      button => button.textContent?.trim() === '保存'
+    )
+    save!.click()
+    await nextTick()
+
+    expect(submitted?.id).toBe('setting-1')
+    expect(submitted).not.toHaveProperty('providerId')
+    expect(submitted).not.toHaveProperty('provider_id')
+  })
+
+  it('shows referenced models and explicitly cascades provider deletion', async () => {
+    const nativeConfirm = vi.spyOn(window, 'confirm')
+    const root = await mount(CustomProviderManager, {
+      providers: [customProvider],
+      settings: [customSetting]
+    })
+
+    expect(root.textContent).toContain('Gemma4 12B Omni')
+    const remove = Array.from(root.querySelectorAll('button')).find(button =>
+      button.textContent?.includes('删除供应商及 1 个模型')
+    )
+    expect(remove).toBeTruthy()
+    expect(remove!.disabled).toBe(false)
+
+    remove!.click()
+    await nextTick()
+
+    const inlineConfirm = root.querySelector<HTMLElement>(
+      '[data-testid="delete-custom-provider-confirm"]'
+    )
+    expect(inlineConfirm?.textContent).toContain('Gemma4 12B Omni')
+    expect(nativeConfirm).not.toHaveBeenCalled()
+    expect(agentSettingsApi.deleteProvider).not.toHaveBeenCalled()
+
+    root
+      .querySelector<HTMLButtonElement>('[data-testid="delete-custom-provider-confirm-confirm"]')!
+      .click()
+    await nextTick()
+    await nextTick()
+
+    expect(agentSettingsApi.deleteProvider).toHaveBeenCalledWith(customProvider.id, {
+      cascade: true
+    })
+  })
+
+  it('keeps an unsaved provider draft when unrelated settings refresh', async () => {
+    const settings = ref<LLMSetting[]>([customSetting])
+    const Wrapper = defineComponent({
+      setup: () => () =>
+        h(CustomProviderManager, {
+          providers: [customProvider],
+          settings: settings.value
+        })
+    })
+    const root = await mount(Wrapper, {})
+    const nameInput = Array.from(root.querySelectorAll<HTMLInputElement>('input')).find(
+      input => input.value === customProvider.name
+    )!
+
+    nameInput.value = 'Unsaved provider name'
+    nameInput.dispatchEvent(new Event('input'))
+    await nextTick()
+    settings.value = [{ ...customSetting, is_active: false }]
+    await nextTick()
+
+    expect(nameInput.value).toBe('Unsaved provider name')
+  })
+
+  it('creates a provider before any model is known', async () => {
+    const root = await mount(CustomProviderManager, {
+      providers: [],
+      settings: []
+    })
+    const providerId = root.querySelector<HTMLInputElement>('input[placeholder="custom-openai"]')!
+    const baseUrl = root.querySelector<HTMLInputElement>(
+      'input[placeholder="https://api.example.com/v1"]'
+    )!
+    const displayName = Array.from(root.querySelectorAll<HTMLInputElement>('input')).find(
+      input => input !== providerId && input !== baseUrl
+    )!
+
+    providerId.value = 'model-later'
+    providerId.dispatchEvent(new Event('input'))
+    displayName.value = 'Model Later'
+    displayName.dispatchEvent(new Event('input'))
+    baseUrl.value = 'https://models.example/v1'
+    baseUrl.dispatchEvent(new Event('input'))
+    await nextTick()
+
+    expect(root.textContent).not.toContain('默认模型')
+    const save = Array.from(root.querySelectorAll<HTMLButtonElement>('button')).find(
+      button => button.textContent?.trim() === '保存'
+    )!
+    expect(save.disabled).toBe(false)
+    save.click()
+    await nextTick()
+    await nextTick()
+
+    expect(agentSettingsApi.createProvider).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'model-later',
+        name: 'Model Later',
+        base_url: 'https://models.example/v1'
+      })
+    )
+    expect(vi.mocked(agentSettingsApi.createProvider).mock.calls[0]?.[0])
+      .not.toHaveProperty('default_model')
+  })
+
+  it('derives and saves HTTP and WebSocket endpoints for an ASR provider', async () => {
+    const root = await mount(CustomProviderManager, {
+      providers: [asrProvider],
+      settings: [asrSetting]
+    })
+
+    expect(
+      root.querySelector<HTMLInputElement>('[data-testid="provider-asr-http-url"]')?.value
+    ).toBe('http://192.168.100.10:5002/v1/audio/transcriptions')
+    expect(
+      root.querySelector<HTMLInputElement>('[data-testid="provider-asr-realtime-url"]')?.value
+    ).toBe('ws://192.168.100.10:5002/v1/realtime')
+    expect(root.textContent).not.toContain('各协议接入地址')
+    expect(root.querySelector('input[placeholder="Chat Completions URL"]')).toBeNull()
+    expect(root.querySelector('input[placeholder="Responses URL"]')).toBeNull()
+    expect(root.querySelector('input[placeholder="Anthropic URL"]')).toBeNull()
+
+    // A derived realtime candidate is only saved automatically after a
+    // verified WebSocket handshake (issue #193).
+    root.querySelector<HTMLButtonElement>('[data-testid="provider-test-voice-endpoints"]')!.click()
+    await nextTick()
+    await nextTick()
+    expect(root.querySelector('[data-testid="provider-endpoint-test-result"]')?.textContent)
+      .toContain('端点可用')
+
+    const save = Array.from(root.querySelectorAll('button')).find(
+      button => button.textContent?.trim() === '保存'
+    )!
+    save.click()
+    await nextTick()
+    await nextTick()
+
+    expect(agentSettingsApi.updateProvider).toHaveBeenCalledWith(
+      asrProvider.id,
+      expect.objectContaining({
+        base_url: 'http://192.168.100.10:5002/v1',
+        voice_adapter: 'openai_audio',
+        asr_async_url: 'http://192.168.100.10:5002/v1/audio/transcriptions',
+        asr_realtime_url: 'ws://192.168.100.10:5002/v1/realtime'
+      })
+    )
+  })
+
+  it('persists a derived realtime URL verified through the explicit capability outcome', async () => {
+    vi.mocked(testVoiceEndpoints).mockResolvedValueOnce({
+      success: true,
+      data: {
+        ok: true,
+        results: [
+          {
+            id: 'asr_http',
+            kind: 'http',
+            url: 'http://192.168.100.10:5002/v1/audio/transcriptions',
+            ok: true,
+            reachable: true,
+            status_code: 200,
+            message: 'Endpoint is reachable'
+          },
+          {
+            id: 'asr_realtime',
+            kind: 'websocket',
+            url: 'ws://192.168.100.10:5002/v1/realtime',
+            ok: true,
+            reachable: true,
+            capability: 'verified',
+            message: 'WebSocket handshake succeeded'
+          }
+        ]
+      }
+    } as never)
+    const root = await mount(CustomProviderManager, {
+      providers: [asrProvider],
+      settings: [asrSetting]
+    })
+
+    root.querySelector<HTMLButtonElement>('[data-testid="provider-test-voice-endpoints"]')!.click()
+    await nextTick()
+    await nextTick()
+    Array.from(root.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === '保存')!
+      .click()
+    await nextTick()
+    await nextTick()
+
+    expect(agentSettingsApi.updateProvider).toHaveBeenCalledWith(
+      asrProvider.id,
+      expect.objectContaining({ asr_realtime_url: 'ws://192.168.100.10:5002/v1/realtime' })
+    )
+  })
+
+  it('does not persist the derived realtime WebSocket URL before it is verified', async () => {
+    const root = await mount(CustomProviderManager, {
+      providers: [asrProvider],
+      settings: [asrSetting]
+    })
+
+    Array.from(root.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === '保存')!
+      .click()
+    await nextTick()
+    await nextTick()
+
+    expect(agentSettingsApi.updateProvider).toHaveBeenCalledWith(
+      asrProvider.id,
+      expect.objectContaining({
+        asr_async_url: 'http://192.168.100.10:5002/v1/audio/transcriptions',
+        asr_realtime_url: ''
+      })
+    )
+  })
+
+  // Reporter's SenseVoice case (issue #193): batch transcription works but
+  // the derived realtime candidate answers 401 before any WebSocket
+  // upgrade. The settings flow must not persist the derived URL and must
+  // not label the endpoint as verified realtime support.
+  it.each([
+    ['401 (legacy ok=true shape)', { ok: true, reachable: true, status_code: 401, message: 'WebSocket endpoint is reachable and requires authentication or handshake parameters' }],
+    ['403 (explicit authentication_required)', { ok: false, reachable: true, status_code: 403, capability: 'authentication_required', message: 'Endpoint requires authentication' }],
+    ['404 (explicit not_found)', { ok: false, reachable: true, status_code: 404, capability: 'not_found', message: 'WebSocket handshake returned HTTP 404' }]
+  ])('does not persist the derived realtime URL when batch works but the probe returns %s', async (_label, realtimeProbe) => {
+    vi.mocked(testVoiceEndpoints).mockResolvedValueOnce({
+      success: true,
+      data: {
+        ok: false,
+        results: [
+          {
+            id: 'asr_http',
+            kind: 'http',
+            url: 'http://192.168.100.10:5002/v1/audio/transcriptions',
+            ok: true,
+            reachable: true,
+            status_code: 200,
+            message: 'Endpoint is reachable'
+          },
+          {
+            id: 'asr_realtime',
+            kind: 'websocket',
+            url: 'ws://192.168.100.10:5002/v1/realtime',
+            ...realtimeProbe
+          }
+        ]
+      }
+    } as never)
+    const root = await mount(CustomProviderManager, {
+      providers: [asrProvider],
+      settings: [asrSetting]
+    })
+
+    root.querySelector<HTMLButtonElement>('[data-testid="provider-test-voice-endpoints"]')!.click()
+    await nextTick()
+    await nextTick()
+
+    const resultText = root.querySelector('[data-testid="provider-endpoint-test-result"]')!
+    expect(resultText.textContent).toContain('部分端点不可用')
+    // The batch HTTP endpoint stays reachable (✓); the realtime WebSocket
+    // endpoint must be marked failed, never verified.
+    expect(resultText.textContent).toMatch(/ASR 实时 WebSocket \(\d+\) ✕/)
+    expect(resultText.textContent).not.toMatch(/ASR 实时 WebSocket[^·]*✓/)
+    expect(resultText.textContent).not.toContain('端点可用')
+
+    Array.from(root.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === '保存')!
+      .click()
+    await nextTick()
+    await nextTick()
+
+    expect(agentSettingsApi.updateProvider).toHaveBeenCalledWith(
+      asrProvider.id,
+      expect.objectContaining({
+        asr_async_url: 'http://192.168.100.10:5002/v1/audio/transcriptions',
+        asr_realtime_url: ''
+      })
+    )
+  })
+
+  it('shows the authentication-required probe message without labeling it verified', async () => {
+    vi.mocked(testVoiceEndpoints).mockResolvedValueOnce({
+      success: true,
+      data: {
+        ok: false,
+        results: [
+          {
+            id: 'asr_realtime',
+            kind: 'websocket',
+            url: 'ws://192.168.100.10:5002/v1/realtime',
+            ok: false,
+            reachable: true,
+            status_code: 401,
+            capability: 'authentication_required',
+            message: 'Endpoint requires authentication before the WebSocket upgrade'
+          }
+        ]
+      }
+    } as never)
+    const root = await mount(CustomProviderManager, {
+      providers: [asrProvider],
+      settings: [asrSetting]
+    })
+
+    root.querySelector<HTMLButtonElement>('[data-testid="provider-test-voice-endpoints"]')!.click()
+    await nextTick()
+    await nextTick()
+
+    const resultText = root.querySelector('[data-testid="provider-endpoint-test-result"]')!.textContent!
+    expect(resultText).toContain('(401)')
+    expect(resultText).toContain('Endpoint requires authentication before the WebSocket upgrade')
+    expect(resultText).toContain('✕')
+    expect(resultText).not.toContain('✓')
+  })
+
+  it('keeps a user-entered realtime URL through unrelated edits without a probe', async () => {
+    const root = await mount(CustomProviderManager, {
+      providers: [asrProvider],
+      settings: [asrSetting]
+    })
+    const wsInput = root.querySelector<HTMLInputElement>('[data-testid="provider-asr-realtime-url"]')!
+    wsInput.value = 'ws://speech.example/custom-realtime'
+    wsInput.dispatchEvent(new Event('input'))
+    await nextTick()
+
+    // Unrelated edit: change the display name only.
+    const nameInput = Array.from(root.querySelectorAll<HTMLInputElement>('input')).find(
+      input => input.value === asrProvider.name
+    )!
+    nameInput.value = 'Renamed ASR Provider'
+    nameInput.dispatchEvent(new Event('input'))
+    await nextTick()
+
+    Array.from(root.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === '保存')!
+      .click()
+    await nextTick()
+    await nextTick()
+
+    expect(agentSettingsApi.updateProvider).toHaveBeenCalledWith(
+      asrProvider.id,
+      expect.objectContaining({
+        name: 'Renamed ASR Provider',
+        asr_realtime_url: 'ws://speech.example/custom-realtime'
+      })
+    )
+  })
+
+  it('keeps an explicitly cleared realtime URL empty when saving', async () => {
+    const root = await mount(CustomProviderManager, {
+      providers: [asrProvider],
+      settings: [asrSetting]
+    })
+    const wsInput = root.querySelector<HTMLInputElement>('[data-testid="provider-asr-realtime-url"]')!
+    wsInput.value = ''
+    wsInput.dispatchEvent(new Event('input'))
+    await nextTick()
+
+    Array.from(root.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === '保存')!
+      .click()
+    await nextTick()
+    await nextTick()
+
+    // The derived ws:// default must not be silently restored.
+    expect(agentSettingsApi.updateProvider).toHaveBeenCalledWith(
+      asrProvider.id,
+      expect.objectContaining({ asr_realtime_url: '' })
+    )
+  })
+
+  it('loads a saved empty realtime URL as intentionally cleared and keeps it empty on later edits', async () => {
+    const clearedProvider: Provider = { ...asrProvider, asr_realtime_url: '' }
+    const root = await mount(CustomProviderManager, {
+      providers: [clearedProvider],
+      settings: [asrSetting]
+    })
+
+    const wsInput = root.querySelector<HTMLInputElement>('[data-testid="provider-asr-realtime-url"]')!
+    expect(wsInput.value).toBe('')
+    expect(root.textContent).toContain('恢复自动')
+
+    // Later unrelated edit: rename the provider and save again.
+    const nameInput = Array.from(root.querySelectorAll<HTMLInputElement>('input')).find(
+      input => input.value === clearedProvider.name
+    )!
+    nameInput.value = 'Local ASR (batch only)'
+    nameInput.dispatchEvent(new Event('input'))
+    await nextTick()
+
+    Array.from(root.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === '保存')!
+      .click()
+    await nextTick()
+    await nextTick()
+
+    expect(agentSettingsApi.updateProvider).toHaveBeenCalledWith(
+      clearedProvider.id,
+      expect.objectContaining({
+        name: 'Local ASR (batch only)',
+        asr_realtime_url: ''
+      })
+    )
+  })
+
+  it('updates derived voice endpoints with Base URL and preserves a custom override', async () => {
+    const root = await mount(CustomProviderManager, {
+      providers: [asrProvider],
+      settings: [asrSetting]
+    })
+    const baseInput = Array.from(root.querySelectorAll<HTMLInputElement>('input')).find(
+      input => input.value === asrProvider.base_url
+    )!
+    const httpInput = root.querySelector<HTMLInputElement>('[data-testid="provider-asr-http-url"]')!
+    const wsInput = root.querySelector<HTMLInputElement>('[data-testid="provider-asr-realtime-url"]')!
+
+    wsInput.value = 'ws://speech.example/custom-realtime'
+    wsInput.dispatchEvent(new Event('input'))
+    baseInput.value = 'https://speech.example:7443'
+    baseInput.dispatchEvent(new Event('input'))
+    await nextTick()
+
+    expect(httpInput.value).toBe('https://speech.example:7443/v1/audio/transcriptions')
+    expect(wsInput.value).toBe('ws://speech.example/custom-realtime')
+    expect(root.textContent).toContain('恢复自动')
+
+    Array.from(root.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === '恢复自动')!
+      .click()
+    await nextTick()
+    expect(wsInput.value).toBe('wss://speech.example:7443/v1/realtime')
+  })
+
+  it('tests the derived HTTP and WebSocket endpoints with one action', async () => {
+    const root = await mount(CustomProviderManager, {
+      providers: [asrProvider],
+      settings: [asrSetting]
+    })
+
+    root.querySelector<HTMLButtonElement>('[data-testid="provider-test-voice-endpoints"]')!.click()
+    await nextTick()
+    await nextTick()
+
+    expect(testVoiceEndpoints).toHaveBeenCalledWith([
+      {
+        id: 'asr_http',
+        kind: 'http',
+        url: 'http://192.168.100.10:5002/v1/audio/transcriptions'
+      },
+      {
+        id: 'asr_realtime',
+        kind: 'websocket',
+        url: 'ws://192.168.100.10:5002/v1/realtime'
+      }
+    ])
+    expect(root.querySelector('[data-testid="provider-endpoint-test-result"]')?.textContent)
+      .toContain('端点可用')
+  })
+
+  it('keeps saved voice endpoints when a provider capability is disabled', async () => {
+    const root = await mount(CustomProviderManager, {
+      providers: [asrProvider],
+      settings: [asrSetting]
+    })
+    const capabilityButton = (name: string) =>
+      Array.from(root.querySelectorAll<HTMLButtonElement>('button')).find(
+        button => button.textContent?.trim() === name
+      )!
+
+    capabilityButton('LLM').click()
+    capabilityButton('ASR').click()
+    await nextTick()
+    Array.from(root.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === '保存')!
+      .click()
+    await nextTick()
+    await nextTick()
+
+    const payload = vi.mocked(agentSettingsApi.updateProvider).mock.calls.at(-1)?.[1]
+    expect(payload).toMatchObject({ supports_llm: true, supports_asr: false })
+    expect(payload?.asr_async_url).toBeUndefined()
+    expect(payload?.asr_realtime_url).toBeUndefined()
+  })
+})

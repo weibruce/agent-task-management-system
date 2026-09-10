@@ -1,0 +1,4 @@
+interface:
+  display_name: "Atms Install Ops"
+  short_description: "Deploy and verify local-source Atms."
+  default_prompt: "Use $atms-install-ops to deploy Atms from a local checkout and run a smoke DAG."

@@ -1,0 +1,1201 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import Database from "better-sqlite3";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import { ChangeOrchestrator } from "../src/orchestration/change-orchestrator.js";
+import { subscribe } from "../src/events/bus.js";
+import { FakeDAGDispatcher } from "../src/orchestration/dag-dispatcher.js";
+import { instantiateDAGPattern } from "../src/orchestration/dag-patterns.js";
+import { GraphExecutor } from "../src/orchestration/graph-executor.js";
+import { parseWorkflowSource } from "../src/orchestration/workflow-spec-v1.js";
+import { closeDb, getDb } from "../src/persistence/db.js";
+import {
+  createPendingApproval,
+  decideApproval,
+  getApproval,
+  getDagState,
+  listPendingApprovals,
+  reserveDagBudget,
+  updateDagState,
+} from "../src/persistence/dag-runtime-primitives.js";
+import { listDagTriggers } from "../src/persistence/dag-triggers.js";
+import { upsertDagWorkflowFromYaml } from "../src/persistence/dag-workflows.js";
+import { listPersistedRunIds, loadRunSnapshot } from "../src/persistence/store.js";
+import {
+  _clearActiveRuns,
+  appendRunNode,
+  buildCurrentDispatchEnvelope,
+  decideActiveRunApproval,
+  expireActiveRunApprovals,
+  failActiveRun,
+  getActiveRun,
+  getCurrentNodeSession,
+  handoffActiveRun,
+  recordAdvisorCall,
+  requestNodeCorrection,
+  recoverAllActiveRuns,
+} from "../src/runtime/active-runs.js";
+import { fireDagEventTrigger, startDagTriggerScheduler } from "../src/runtime/dag-triggers.js";
+import { isDagApprovalRequestAuthorized, requiresDagMutationAuthorization } from "../src/server/mutations.js";
+
+function yaml(id: string, body: string): string {
+  return `
+api_version: atms.ai/v1
+kind: Workflow
+metadata: { id: ${id}, name: ${id} }
+spec:
+${body.replace(/^/gm, "  ")}
+`;
+}
+
+describe("DAG runtime pattern primitives", () => {
+  let tmpHome: string;
+  let oldHome: string | undefined;
+  let oldAllowlist: string | undefined;
+  let oldDynamicCommands: string | undefined;
+
+  beforeEach(() => {
+    oldHome = process.env.ATMS_HOME;
+    oldAllowlist = process.env.ATMS_DAG_COMMAND_ALLOWLIST;
+    oldDynamicCommands = process.env.ATMS_DAG_ALLOW_DYNAMIC_COMMANDS;
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "atms-runtime-primitives-"));
+    process.env.ATMS_HOME = tmpHome;
+    process.env.ATMS_DAG_COMMAND_ALLOWLIST = "node";
+    process.env.ATMS_DAG_ALLOW_DYNAMIC_COMMANDS = "true";
+    closeDb();
+    _clearActiveRuns();
+  });
+
+  afterEach(() => {
+    _clearActiveRuns();
+    closeDb();
+    if (oldHome === undefined) delete process.env.ATMS_HOME;
+    else process.env.ATMS_HOME = oldHome;
+    if (oldAllowlist === undefined) delete process.env.ATMS_DAG_COMMAND_ALLOWLIST;
+    else process.env.ATMS_DAG_COMMAND_ALLOWLIST = oldAllowlist;
+    if (oldDynamicCommands === undefined) delete process.env.ATMS_DAG_ALLOW_DYNAMIC_COMMANDS;
+    else process.env.ATMS_DAG_ALLOW_DYNAMIC_COMMANDS = oldDynamicCommands;
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  it("executes an allowlisted deterministic command and captures typed evidence", () => {
+    const telemetry: unknown[] = [];
+    const unsubscribe = subscribe("dag:deterministic_command", (payload) => telemetry.push(payload));
+    const parsed = parseWorkflowSource(yaml("command-check", `
+contracts:
+  Check: { type: object }
+agents: {}
+nodes:
+  check:
+    kind: command
+    inputs: { task: { contract: Check } }
+    outputs: { passed: {}, failed: {} }
+    config:
+      command_field: command
+      timeout_ms: 5000
+      success_port: passed
+      failure_port: failed
+      parse_stdout: json
+  done: { kind: terminal, outcome: success, inputs: { result: {} } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: $run.input, to: check.task }
+  - { from: check.passed, to: done.result }
+  - { from: check.failed, to: failed.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun("command-run", parsed, JSON.stringify({
+      command: ["node", "-e", "console.log(JSON.stringify({metric:3,api_key:'sk-commandsecret12345'}))"],
+      api_key: "sk-inputsecret123456",
+    }));
+    expect(executor.tick("command-run")).toBe(1);
+    expect(getActiveRun("command-run")?.status).toBe("completed");
+    const snapshot = getActiveRun("command-run");
+    expect(snapshot?.dagRun.nodeStates.get("check")).toBe("COMPLETED");
+    const persisted = JSON.stringify(loadRunSnapshot("command-run")?.handoffs ?? []);
+    expect(persisted).toContain("sk-commandsecret12345");
+    expect(persisted).toContain("sk-inputsecret123456");
+    expect(JSON.stringify(telemetry)).not.toContain("sk-commandsecret12345");
+    expect(JSON.stringify(telemetry)).not.toContain("sk-inputsecret123456");
+    expect(JSON.stringify(telemetry)).toContain("***REDACTED***");
+    unsubscribe();
+  });
+
+  it("can hand off only a successfully parsed command value", () => {
+    const parsed = parseWorkflowSource(yaml("command-value-payload", `
+contracts:
+  Result:
+    type: object
+    additionalProperties: false
+    required: [verdict]
+    properties: { verdict: { const: pass } }
+agents: {}
+nodes:
+  check:
+    kind: command
+    outputs: { passed: { contract: Result } }
+    config:
+      command: [node, -e, "process.stdout.write(JSON.stringify({verdict:'pass'}))"]
+      timeout_ms: 5000
+      success_port: passed
+      failure_port: passed
+      parse_stdout: json
+      result_payload: value
+  done: { kind: terminal, outcome: success, inputs: { result: { contract: Result } } }
+edges:
+  - { from: check.passed, to: done.result }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun("command-value-payload-run", parsed);
+
+    expect(executor.tick("command-value-payload-run")).toBe(1);
+    expect(getActiveRun("command-value-payload-run")?.status).toBe("completed");
+    expect(loadRunSnapshot("command-value-payload-run")?.handoffs.find((handoff) => handoff.fromNode === "check")?.content)
+      .toEqual({ verdict: "pass" });
+  });
+
+  it("preserves the command evidence envelope when value projection fails", () => {
+    const parsed = parseWorkflowSource(yaml("command-value-failure", `
+agents: {}
+nodes:
+  check:
+    kind: command
+    outputs: { passed: {}, failed: {} }
+    config:
+      command: [node, -e, "process.stdout.write(JSON.stringify({verdict:'unknown'}));process.exit(7)"]
+      timeout_ms: 5000
+      success_port: passed
+      failure_port: failed
+      parse_stdout: json
+      result_payload: value
+  done: { kind: terminal, outcome: success, inputs: { result: {} } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: check.passed, to: done.result }
+  - { from: check.failed, to: failed.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun("command-value-failure-run", parsed);
+
+    expect(executor.tick("command-value-failure-run")).toBe(1);
+    expect(getActiveRun("command-value-failure-run")?.status).toBe("failed");
+    expect(loadRunSnapshot("command-value-failure-run")?.handoffs.find((handoff) => handoff.fromNode === "check")?.content)
+      .toMatchObject({
+        ok: false,
+        exit_code: 7,
+        value: { verdict: "unknown" },
+        parse_failed: false,
+      });
+  });
+
+  it("selects an authoritative command input while other ports gate readiness", () => {
+    const parsed = parseWorkflowSource(yaml("command-selected-input", `
+agents:
+  source: { system: Supply input. }
+nodes:
+  order_source: { kind: agent, agent: source, outputs: { order: {} } }
+  verdict_source: { kind: agent, agent: source, outputs: { verdict: {} } }
+  check:
+    kind: command
+    inputs: { verdict: {}, order: {} }
+    outputs: { passed: {}, failed: {} }
+    config:
+      input: order
+      command_field: check_command
+      timeout_ms: 5000
+      success_port: passed
+      failure_port: failed
+  done: { kind: terminal, outcome: success, inputs: { result: {} } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: order_source.order, to: check.order }
+  - { from: verdict_source.verdict, to: check.verdict }
+  - { from: check.passed, to: done.result }
+  - { from: check.failed, to: failed.result, condition: on_failure }
+`));
+    parsed.meta.agents!.source = { ...parsed.meta.agents!.source, agent_type: "deterministic" };
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun("command-selected-input-run", parsed);
+    expect(executor.tick("command-selected-input-run")).toBe(2);
+    handoffActiveRun("command-selected-input-run", "verdict_source", "verdict", { verdict: "pass" });
+    handoffActiveRun("command-selected-input-run", "order_source", "order", {
+      check_command: ["node", "-e", "process.exit(0)"],
+    });
+    expect(executor.tick("command-selected-input-run")).toBeGreaterThan(0);
+    expect(getActiveRun("command-selected-input-run")?.status).toBe("completed");
+  });
+
+  it("runs a deterministic command inside the contained run workspace with all named inputs", () => {
+    const runId = "command-run-workspace";
+    const source = path.join(tmpHome, "workspace", runId, "source");
+    fs.mkdirSync(source, { recursive: true });
+    fs.writeFileSync(path.join(source, "marker.txt"), "workspace-ok", "utf8");
+    const parsed = parseWorkflowSource(yaml("command-run-workspace", `
+contracts:
+  Payload: { type: object }
+agents: {}
+nodes:
+  check:
+    kind: command
+    inputs: { left: { contract: Payload }, right: { contract: Payload } }
+    outputs: { passed: {}, failed: {} }
+    config:
+      command: [node, -e, "const fs=require('fs');let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.stringify({marker:fs.readFileSync('marker.txt','utf8'),ports:Object.keys(JSON.parse(s)).sort()})))"]
+      stdin_field: $inputs
+      cwd: $run_workspace/source
+      timeout_ms: 5000
+      success_port: passed
+      failure_port: failed
+      parse_stdout: json
+  done: { kind: terminal, outcome: success, inputs: { result: {} } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: $run.input, to: check.left }
+  - { from: $run.input, to: check.right }
+  - { from: check.passed, to: done.result }
+  - { from: check.failed, to: failed.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun(runId, parsed, JSON.stringify({ value: 3 }));
+    expect(executor.tick(runId)).toBe(1);
+    expect(getActiveRun(runId)?.status).toBe("completed");
+    expect(loadRunSnapshot(runId)?.handoffs.find((handoff) => handoff.fromNode === "check")?.content)
+      .toMatchObject({
+        ok: true,
+        cwd: "$run_workspace/source",
+        value: { marker: "workspace-ok", ports: ["left", "right"] },
+        input: { left: [{ value: 3 }], right: [{ value: 3 }] },
+      });
+  });
+
+  it("rejects a run-workspace command cwd that escapes containment", () => {
+    const runId = "command-run-workspace-escape";
+    fs.mkdirSync(path.join(tmpHome, "workspace", runId), { recursive: true });
+    const parsed = parseWorkflowSource(yaml("command-run-workspace-escape", `
+agents: {}
+nodes:
+  check:
+    kind: command
+    outputs: { passed: {}, failed: {} }
+    config:
+      command: [node, -e, process.exit(0)]
+      cwd: $run_workspace/../outside
+      timeout_ms: 5000
+      success_port: passed
+      failure_port: failed
+  done: { kind: terminal, outcome: success, inputs: { result: {} } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: check.passed, to: done.result }
+  - { from: check.failed, to: failed.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun(runId, parsed);
+    expect(executor.tick(runId)).toBe(1);
+    expect(getActiveRun(runId)?.status).toBe("failed");
+    expect(loadRunSnapshot(runId)?.handoffs.find((handoff) => handoff.fromNode === "check")?.content)
+      .toMatchObject({ ok: false, error: "command cwd escapes run workspace" });
+  });
+
+  it("rejects a run workspace symlink that resolves outside the workspace root", () => {
+    const runId = "command-run-workspace-root-symlink";
+    const workspaceRoot = path.join(tmpHome, "workspace");
+    const outside = path.join(tmpHome, "outside-run-workspace");
+    fs.mkdirSync(workspaceRoot, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.symlinkSync(outside, path.join(workspaceRoot, runId), "dir");
+    const parsed = parseWorkflowSource(yaml(runId, `
+agents: {}
+nodes:
+  check:
+    kind: command
+    outputs: { passed: {}, failed: {} }
+    config:
+      command: [node, -e, process.exit(0)]
+      cwd: $run_workspace
+      timeout_ms: 5000
+      success_port: passed
+      failure_port: failed
+  done: { kind: terminal, outcome: success, inputs: { result: {} } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: check.passed, to: done.result }
+  - { from: check.failed, to: failed.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun(runId, parsed);
+    expect(executor.tick(runId)).toBe(1);
+    expect(getActiveRun(runId)?.status).toBe("failed");
+    expect(loadRunSnapshot(runId)?.handoffs.find((handoff) => handoff.fromNode === "check")?.content)
+      .toMatchObject({ ok: false, error: "command run workspace resolves outside workspace root" });
+  });
+
+  it("rejects a run-workspace cwd symlink that resolves outside its run", () => {
+    const runId = "command-run-workspace-cwd-symlink";
+    const runWorkspace = path.join(tmpHome, "workspace", runId);
+    const outside = path.join(tmpHome, "outside-command-cwd");
+    fs.mkdirSync(runWorkspace, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.symlinkSync(outside, path.join(runWorkspace, "source"), "dir");
+    const parsed = parseWorkflowSource(yaml(runId, `
+agents: {}
+nodes:
+  check:
+    kind: command
+    outputs: { passed: {}, failed: {} }
+    config:
+      command: [node, -e, process.exit(0)]
+      cwd: $run_workspace/source
+      timeout_ms: 5000
+      success_port: passed
+      failure_port: failed
+  done: { kind: terminal, outcome: success, inputs: { result: {} } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: check.passed, to: done.result }
+  - { from: check.failed, to: failed.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun(runId, parsed);
+    expect(executor.tick(runId)).toBe(1);
+    expect(getActiveRun(runId)?.status).toBe("failed");
+    expect(loadRunSnapshot(runId)?.handoffs.find((handoff) => handoff.fromNode === "check")?.content)
+      .toMatchObject({ ok: false, error: "command cwd resolves outside run workspace" });
+  });
+
+  it("runs the ratchet through adjacent command measurements and enrolls the floor", () => {
+    const workflowId = "ratchet-runtime-test";
+    const parsed = instantiateDAGPattern("ratchet", {
+      workflow_id: workflowId,
+      target: 0,
+      max_iterations: 2,
+    }).parsed;
+    parsed.meta.agents.improver = { ...parsed.meta.agents.improver, agent_type: "deterministic" };
+    const measureCommand = [
+      "node",
+      "-e",
+      "const fs=require('fs'),p=require('path').join(process.env.ATMS_HOME,'ratchet.metric');let n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8')):3;n=Math.max(0,n-1);fs.writeFileSync(p,String(n));console.log(n)",
+    ];
+    const rollbackCommand = ["node", "-e", "process.exit(0)"];
+    const executor = new GraphExecutor({
+      dispatch: () => ({ status: "dispatched", targetType: "fake", targetId: "ratchet-test" }),
+    });
+    executor.createRun("ratchet-runtime-run", parsed, JSON.stringify({ measure_command: measureCommand, rollback_command: rollbackCommand }));
+
+    expect(executor.tick("ratchet-runtime-run")).toBeGreaterThan(0);
+    expect(getActiveRun("ratchet-runtime-run")?.dagRun.nodeStates.get("improve")).toBe("RUNNING");
+    handoffActiveRun("ratchet-runtime-run", "improve", "changed", { measure_command: measureCommand, rollback_command: rollbackCommand });
+
+    expect(executor.tick("ratchet-runtime-run")).toBeGreaterThan(0);
+    expect(getActiveRun("ratchet-runtime-run")?.dagRun.handoffedNodes.has("improve")).toBe(false);
+    if (getActiveRun("ratchet-runtime-run")?.dagRun.nodeStates.get("improve") === "READY") {
+      expect(executor.tick("ratchet-runtime-run")).toBeGreaterThan(0);
+    }
+    expect(getActiveRun("ratchet-runtime-run")?.dagRun.nodeStates.get("improve")).toBe("RUNNING");
+    handoffActiveRun("ratchet-runtime-run", "improve", "changed", { measure_command: measureCommand, rollback_command: rollbackCommand });
+
+    expect(executor.tick("ratchet-runtime-run")).toBeGreaterThan(0);
+    expect(getActiveRun("ratchet-runtime-run")?.status).toBe("completed");
+    expect(getDagState("standing-goal-floors", workflowId)?.value).toBe(0);
+  });
+
+  it("does not allow a path-shaped executable to bypass the command allowlist", () => {
+    const parsed = parseWorkflowSource(yaml("command-path-check", `
+agents: {}
+nodes:
+  check:
+    kind: command
+    outputs: { passed: {}, failed: {} }
+    config:
+      command: [/tmp/untrusted/node, -e, process.exit(0)]
+      timeout_ms: 5000
+      success_port: passed
+      failure_port: failed
+  done: { kind: terminal, outcome: success, inputs: { result: {} } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: check.passed, to: done.result }
+  - { from: check.failed, to: failed.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun("command-path-run", parsed);
+    executor.tick("command-path-run");
+    expect(getActiveRun("command-path-run")?.status).toBe("failed");
+  });
+
+  it("updates a trust ledger atomically and demotes on verified failure", () => {
+    const source = yaml("trust-state", `
+contracts:
+  Verdict: { type: object }
+agents: {}
+nodes:
+  update:
+    kind: state
+    inputs: { verdict: { contract: Verdict } }
+    outputs: { done: {}, conflict: {} }
+    config:
+      namespace: trust
+      key: lint
+      operation: trust_update
+      pass_field: verdict
+      auto_min_runs: 2
+      auto_min_rate: 1
+      watch_min_rate: 0.9
+      success_port: done
+      conflict_port: conflict
+  terminal: { kind: terminal, outcome: success, inputs: { result: {} } }
+  conflict: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: $run.input, to: update.verdict }
+  - { from: update.done, to: terminal.result }
+  - { from: update.conflict, to: conflict.result, condition: on_failure }
+`);
+    for (const [runId, verdict] of [["trust-pass", "pass"], ["trust-fail", "fail"]] as const) {
+      const executor = new GraphExecutor(new FakeDAGDispatcher());
+      executor.createRun(runId, parseWorkflowSource(source), JSON.stringify({ verdict }));
+      executor.tick(runId);
+    }
+    expect(getDagState("trust", "lint")).toMatchObject({
+      version: 2,
+      value: { runs: 2, passes: 1, rate: 0.5, tier: "watch", last_result: "fail" },
+    });
+  });
+
+  it("atomically reserves declared budget without double admission", () => {
+    updateDagState({ namespace: "budget", key: "daily", value: 1 });
+    expect(reserveDagBudget({
+      namespace: "budget",
+      key: "daily",
+      amount: 3,
+      limit: 5,
+      runId: "budget-run-1",
+      nodeId: "budget-gate",
+    })).toMatchObject({ admitted: true, spent: 4, requested: 3, remaining: 1 });
+    expect(reserveDagBudget({
+      namespace: "budget",
+      key: "daily",
+      amount: 2,
+      limit: 5,
+      runId: "budget-run-2",
+      nodeId: "budget-gate",
+    })).toMatchObject({ admitted: false, spent: 4, requested: 2, remaining: 1 });
+    expect(getDagState("budget", "daily")).toMatchObject({ version: 2, value: 4 });
+  });
+
+  it("persists approval across recovery and requires actor plus proposal hash", () => {
+    const parsed = parseWorkflowSource(yaml("approval-flow", `
+contracts:
+  Proposal: { type: object }
+agents: {}
+nodes:
+  approve:
+    kind: approval
+    inputs: { proposal: { contract: Proposal } }
+    outputs: { approved: {}, rejected: {} }
+    config:
+      approval_id: release
+      proposer_actor: "agent:release-proposer"
+      authorized_actors: [matrix]
+      approved_port: approved
+      rejected_port: rejected
+  accepted: { kind: terminal, outcome: success, inputs: { result: {} } }
+  denied: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: $run.input, to: approve.proposal }
+  - { from: approve.approved, to: accepted.result }
+  - { from: approve.rejected, to: denied.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun("approval-run", parsed, JSON.stringify({ change: "ship" }));
+    executor.tick("approval-run");
+    const pending = getApproval("approval-run", "approve")!;
+    expect(getActiveRun("approval-run")?.dagRun.nodeStates.get("approve")).toBe("WAITING_FOR_APPROVAL");
+    expect(listPendingApprovals()).toHaveLength(1);
+    expect(pending.proposer_actor).toBe("agent:release-proposer");
+
+    // Simulate a legacy or externally altered row that bypassed DSL validation.
+    getDb().prepare(`
+      UPDATE dag_approvals SET authorized_actors = ? WHERE run_id = ? AND node_id = ?
+    `).run(JSON.stringify(["agent:release-proposer", "matrix"]), "approval-run", "approve");
+    _clearActiveRuns();
+    closeDb();
+    expect(recoverAllActiveRuns().recovered).toContain("approval-run");
+    expect(() => decideActiveRunApproval({
+      runId: "approval-run",
+      nodeId: "approve",
+      decision: "approved",
+      actor: "agent:release-proposer",
+      proposalHash: pending.proposal_hash,
+    })).toThrow("cannot approve its own proposal");
+    decideActiveRunApproval({ runId: "approval-run", nodeId: "approve", decision: "approved", actor: "matrix", proposalHash: pending.proposal_hash });
+    expect(getActiveRun("approval-run")?.status).toBe("completed");
+    expect(() => createPendingApproval({
+      runId: "approval-run",
+      nodeId: "approve",
+      approvalId: "release",
+      proposal: { change: "replace after restart" },
+      proposerActor: "agent:release-proposer",
+      authorizedActors: ["matrix"],
+    })).toThrow("approval decision is immutable: already approved");
+    expect(getApproval("approval-run", "approve")).toMatchObject({
+      status: "approved",
+      actor: "matrix",
+      proposal: { change: "ship" },
+    });
+  });
+
+  it("schedules legacy waiting approvals without proposer identity for deterministic expiry", () => {
+    const managerDir = path.join(tmpHome, "manager");
+    fs.mkdirSync(managerDir, { recursive: true });
+    const legacy = new Database(path.join(managerDir, "atms.db"));
+    legacy.exec(`
+      CREATE TABLE dag_approvals (
+        run_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        approval_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        proposal_hash TEXT NOT NULL,
+        proposal_json TEXT NOT NULL,
+        authorized_actors TEXT NOT NULL,
+        decision TEXT,
+        actor TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        expires_at INTEGER,
+        PRIMARY KEY(run_id, node_id)
+      );
+    `);
+    legacy.prepare(`
+      INSERT INTO dag_approvals(
+        run_id, node_id, approval_id, status, proposal_hash, proposal_json,
+        authorized_actors, created_at, updated_at
+      ) VALUES (?, ?, ?, 'waiting', ?, ?, ?, ?, ?)
+    `).run(
+      "legacy-run",
+      "approve",
+      "release",
+      "legacy-hash",
+      JSON.stringify({ change: "legacy" }),
+      JSON.stringify(["matrix"]),
+      1,
+      1,
+    );
+    legacy.close();
+
+    const columns = getDb().prepare("PRAGMA table_info(dag_approvals)").all() as Array<{ name: string }>;
+    expect(columns.map((column) => column.name)).toContain("proposer_actor");
+    expect(getApproval("legacy-run", "approve")).toMatchObject({
+      status: "waiting",
+      expires_at: 0,
+      proposer_actor: "",
+    });
+    expect(() => decideApproval({
+      runId: "legacy-run",
+      nodeId: "approve",
+      decision: "approved",
+      actor: "matrix",
+      proposalHash: "legacy-hash",
+    })).toThrow("approval expired");
+    expect(getApproval("legacy-run", "approve")?.status).toBe("expired");
+    expect(getDb().prepare("SELECT version FROM schema_migrations WHERE version = 4").get()).toBeTruthy();
+  });
+
+  it("rejects self-approval and preserves a decided approval on re-entry", () => {
+    const parsed = parseWorkflowSource(yaml("approval-immutable", `
+agents: {}
+nodes:
+  approve:
+    kind: approval
+    outputs: { approved: {}, rejected: {} }
+    config:
+      approval_id: release
+      proposer_actor: "agent:proposer"
+      authorized_actors: [matrix]
+      approved_port: approved
+      rejected_port: rejected
+  accepted: { kind: terminal, outcome: success, inputs: { result: {} } }
+  denied: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: approve.approved, to: accepted.result }
+  - { from: approve.rejected, to: denied.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun("approval-immutable-run", parsed);
+    executor.tick("approval-immutable-run");
+    const pending = createPendingApproval({
+      runId: "approval-immutable-run",
+      nodeId: "approve",
+      approvalId: "release",
+      proposal: { change: "ship" },
+      proposerActor: "agent:proposer",
+      authorizedActors: ["agent:proposer", "matrix"],
+    });
+    getDb().prepare("UPDATE dag_approvals SET proposer_actor = '' WHERE run_id = ? AND node_id = ?")
+      .run(pending.run_id, pending.node_id);
+    expect(() => decideApproval({
+      runId: pending.run_id,
+      nodeId: pending.node_id,
+      decision: "approved",
+      actor: "matrix",
+      proposalHash: pending.proposal_hash,
+    })).toThrow("approval proposer identity is unavailable");
+    getDb().prepare("UPDATE dag_approvals SET proposer_actor = ? WHERE run_id = ? AND node_id = ?")
+      .run("agent:proposer", pending.run_id, pending.node_id);
+    expect(() => decideApproval({
+      runId: pending.run_id,
+      nodeId: pending.node_id,
+      decision: "approved",
+      actor: "agent:proposer",
+      proposalHash: pending.proposal_hash,
+    })).toThrow("cannot approve its own proposal");
+
+    decideApproval({
+      runId: pending.run_id,
+      nodeId: pending.node_id,
+      decision: "approved",
+      actor: "matrix",
+      proposalHash: pending.proposal_hash,
+    });
+    expect(() => createPendingApproval({
+      runId: pending.run_id,
+      nodeId: pending.node_id,
+      approvalId: "release",
+      proposal: { change: "replace decision" },
+      proposerActor: "agent:proposer",
+      authorizedActors: ["matrix"],
+    })).toThrow("approval decision is immutable: already approved");
+    expect(getApproval(pending.run_id, pending.node_id)).toMatchObject({
+      status: "approved",
+      decision: "approved",
+      actor: "matrix",
+      proposal: { change: "ship" },
+    });
+  });
+
+  it("keeps approval waiting when its decision handoff violates the output contract", () => {
+    const parsed = parseWorkflowSource(yaml("approval-contract-preflight", `
+contracts:
+  ImpossibleDecision:
+    type: object
+    required: [required_only]
+    properties: { required_only: { type: string } }
+agents: {}
+nodes:
+  approve:
+    kind: approval
+    outputs: { approved: { contract: ImpossibleDecision }, rejected: {} }
+    config:
+      approval_id: release
+      proposer_actor: "agent:proposer"
+      authorized_actors: [matrix]
+      approved_port: approved
+      rejected_port: rejected
+  accepted: { kind: terminal, outcome: success, inputs: { result: {} } }
+  denied: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: approve.approved, to: accepted.result }
+  - { from: approve.rejected, to: denied.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun("approval-contract-run", parsed);
+    executor.tick("approval-contract-run");
+    const pending = getApproval("approval-contract-run", "approve")!;
+
+    expect(() => decideActiveRunApproval({
+      runId: "approval-contract-run",
+      nodeId: "approve",
+      decision: "approved",
+      actor: "matrix",
+      proposalHash: pending.proposal_hash,
+    })).toThrow("DAG_HANDOFF_CONTRACT_VIOLATION");
+    expect(getApproval("approval-contract-run", "approve")?.status).toBe("waiting");
+    expect(getActiveRun("approval-contract-run")?.dagRun.nodeStates.get("approve")).toBe("WAITING_FOR_APPROVAL");
+  });
+
+  it("expires a durable approval and routes it through the rejected port", () => {
+    const parsed = parseWorkflowSource(yaml("approval-expiry", `
+agents: {}
+nodes:
+  approve:
+    kind: approval
+    outputs: { approved: {}, rejected: {} }
+    config:
+      approval_id: release
+      proposer_actor: "agent:release-proposer"
+      authorized_actors: [matrix]
+      expires_after_ms: 1000
+      approved_port: approved
+      rejected_port: rejected
+  accepted: { kind: terminal, outcome: success, inputs: { result: {} } }
+  denied: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: approve.approved, to: accepted.result }
+  - { from: approve.rejected, to: denied.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun("approval-expiry-run", parsed);
+    executor.tick("approval-expiry-run");
+    const approval = getApproval("approval-expiry-run", "approve")!;
+    expect(expireActiveRunApprovals((approval.expires_at ?? Date.now()) + 1)).toHaveLength(1);
+    expect(getApproval("approval-expiry-run", "approve")).toMatchObject({
+      status: "expired",
+      decision: "rejected",
+      actor: "system:expiry",
+    });
+    expect(getActiveRun("approval-expiry-run")?.status).toBe("failed");
+  });
+
+  it("contains an expiry handoff contract failure to the affected run", () => {
+    const parsed = parseWorkflowSource(yaml("approval-expiry-contract", `
+contracts:
+  Text: { type: string }
+agents: {}
+nodes:
+  approve:
+    kind: approval
+    outputs: { approved: {}, rejected: { contract: Text } }
+    config:
+      approval_id: release
+      proposer_actor: "agent:release-proposer"
+      authorized_actors: [matrix]
+      expires_after_ms: 1000
+      approved_port: approved
+      rejected_port: rejected
+  accepted: { kind: terminal, outcome: success, inputs: { result: {} } }
+  denied: { kind: terminal, outcome: failure, inputs: { result: { contract: Text } } }
+edges:
+  - { from: approve.approved, to: accepted.result }
+  - { from: approve.rejected, to: denied.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun("approval-expiry-contract-run", parsed);
+    executor.tick("approval-expiry-contract-run");
+    const approval = getApproval("approval-expiry-contract-run", "approve")!;
+    expect(() => expireActiveRunApprovals((approval.expires_at ?? Date.now()) + 1)).not.toThrow();
+    expect(getActiveRun("approval-expiry-contract-run")?.status).toBe("failed");
+  });
+
+  it("requires local access or an explicit token for human approval decisions", () => {
+    expect(isDagApprovalRequestAuthorized({ remoteAddress: "127.0.0.1" })).toBe(true);
+    expect(isDagApprovalRequestAuthorized({ remoteAddress: "203.0.113.50" })).toBe(false);
+    expect(isDagApprovalRequestAuthorized({
+      remoteAddress: "203.0.113.50",
+      configuredToken: "secret",
+      bodyToken: "secret",
+    })).toBe(true);
+    expect(isDagApprovalRequestAuthorized({
+      remoteAddress: "127.0.0.1",
+      configuredToken: "secret",
+      bodyToken: "wrong",
+    })).toBe(false);
+  });
+
+  it("protects every run mutation and persisted workflow/profile sync route", () => {
+    for (const pathname of [
+      "/api/runs",
+      "/api/runs/create-and-run",
+      "/api/run-inputs",
+      "/api/runs/emergency-stop",
+      "/api/runs/run-1/invoke",
+      "/api/runs/run-1/cancel",
+      "/api/runs/run-1/inject",
+      "/api/runs/run-1/node/node-1/checkpoint-resume",
+      "/api/runs/run-1/dynamic/nodes",
+      "/api/runs/run-1/manager/commands",
+      "/api/dag/workflows/sync",
+      "/api/dag/profiles/sync",
+      "/api/dag/environment/check",
+      "/api/dag/environment/build",
+    ]) {
+      expect(requiresDagMutationAuthorization(pathname, "POST"), pathname).toBe(true);
+    }
+    expect(requiresDagMutationAuthorization("/api/skills/palquery/views/present", "POST")).toBe(false);
+    expect(requiresDagMutationAuthorization("/api/runs/run-1/node/node-1/approval", "POST")).toBe(false);
+    expect(requiresDagMutationAuthorization("/api/dag/validate", "POST")).toBe(false);
+    expect(requiresDagMutationAuthorization("/api/runs", "GET")).toBe(false);
+  });
+
+  it("fans out a dynamic worker count and completes n-of-m early", () => {
+    const parsed = parseWorkflowSource(yaml("dynamic-fanout", `
+contracts:
+  Plan:
+    type: object
+    required: [items, shared]
+    properties:
+      items: { type: array, minItems: 1 }
+      shared: { type: object }
+  WorkerResult:
+    type: object
+    required: [status, evidence]
+    properties:
+      status: { enum: [success, failed] }
+      evidence: {}
+agents:
+  worker: { system: Process one item and hand off result or failed. }
+nodes:
+  fan:
+    kind: fanout
+    inputs: { plan: { contract: Plan } }
+    outputs: { passed: {}, failed: {} }
+    config:
+      input: plan
+      item_field: items
+      context_field: shared
+      worker_agent: worker
+      worker_policy:
+        workspace_access: { writable_paths: [], readonly_paths: [input] }
+        allowed_builtin_tools: [Read]
+        allowed_dag_tools: [handoff]
+        session_scope: dispatch
+      max_items: 5
+      max_parallelism: 2
+      completion: n_of_m
+      threshold: 2
+      result_contract: WorkerResult
+      result_port: passed
+      failed_port: failed
+      cancel_remaining: true
+  done: { kind: terminal, outcome: success, inputs: { result: {} } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: $run.input, to: fan.plan }
+  - { from: fan.passed, to: done.result }
+  - { from: fan.failed, to: failed.result, condition: on_failure }
+`));
+    parsed.meta.agents!.worker.agent_type = "deterministic";
+    const dispatcher = new FakeDAGDispatcher();
+    const executor = new GraphExecutor(dispatcher);
+    executor.createRun("fanout-run", parsed, JSON.stringify({
+      items: ["a", "b", "c"],
+      shared: { repo_dir: "/workspace/repo", head_sha: "abc123" },
+    }));
+    expect(executor.tick("fanout-run")).toBe(3);
+    expect(dispatcher.dispatched.map((entry) => entry.nodeId)).toEqual(["fan__item_0001", "fan__item_0002"]);
+    expect(dispatcher.dispatched[0]?.inputs.item?.[0]).toEqual({
+      item: "a",
+      index: 0,
+      total: 3,
+      context: { repo_dir: "/workspace/repo", head_sha: "abc123" },
+    });
+    expect(getActiveRun("fanout-run")?.dagRun.graph.nodes.find(
+      (node) => node.node_id === "fan__item_0001",
+    )?.extra).toMatchObject({
+      workflow_spec_v1: { output_contracts: { result: "WorkerResult" } },
+      dynamic_fanout: { parent_node: "fan", index: 0, invocation: 1 },
+      agent_runtime: {
+        workspace_access: { writable_paths: [], readonly_paths: ["input"] },
+        allowed_builtin_tools: ["Read"],
+        allowed_dag_tools: ["handoff"],
+        session_scope: "dispatch",
+      },
+    });
+    expect(() => handoffActiveRun("fanout-run", "fan__item_0001", "result", { evidence: "missing status" }))
+      .toThrow("DAG_HANDOFF_CONTRACT_VIOLATION");
+    expect(getActiveRun("fanout-run")?.status).toBe("active");
+    expect(requestNodeCorrection("fanout-run", "fan__item_0001", "missing status").status).toBe("scheduled");
+    handoffActiveRun("fanout-run", "fan__item_0001", "result", { status: "success", evidence: "a" });
+    failActiveRun("fanout-run", "fan__item_0002", "worker exhausted correction attempts");
+    expect(getActiveRun("fanout-run")?.status).toBe("active");
+    expect(getActiveRun("fanout-run")?.dagRun.nodeStates.get("fan__item_0003")).toBe("READY");
+    expect(executor.tick("fanout-run")).toBe(1);
+    handoffActiveRun("fanout-run", "fan__item_0003", "result", { status: "success", evidence: "c" });
+    expect(getActiveRun("fanout-run")?.status).toBe("completed");
+    expect(loadRunSnapshot("fanout-run")?.handoffs.find((entry) => (
+      entry.fromNode === "fan" && entry.port === "passed"
+    ))?.content).toMatchObject({
+      context: { repo_dir: "/workspace/repo", head_sha: "abc123" },
+    });
+    expect(() => handoffActiveRun("fanout-run", "fan__item_0002", "result", { status: "success", evidence: "late" }))
+      .toThrow("not active");
+  });
+
+  it("fails closed when fanout evidence requirements lack a result contract at runtime", () => {
+    const parsed = parseWorkflowSource(yaml("fanout-evidence-contract-runtime", `
+contracts:
+  Items: { type: array }
+  WorkerResult: { type: object }
+  Report: { type: object }
+agents:
+  worker: { system: Process one item. }
+nodes:
+  fan:
+    kind: fanout
+    inputs: { items: { contract: Items } }
+    outputs: { passed: {}, failed: {} }
+    config:
+      input: items
+      worker_agent: worker
+      worker_policy:
+        workspace_access: { writable_paths: [work], readonly_paths: [input] }
+        allowed_dag_tools: [handoff]
+      max_items: 2
+      max_parallelism: 1
+      completion: all
+      result_contract: WorkerResult
+      result_required_workspace_files:
+        - { path_field: report.path, sha256_field: report.sha256, contract: Report }
+      result_port: passed
+      failed_port: failed
+  done: { kind: terminal, outcome: success, inputs: { result: {} } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: $run.input, to: fan.items }
+  - { from: fan.passed, to: done.result }
+  - { from: fan.failed, to: failed.result, condition: on_failure }
+`));
+    const fan = parsed.graph.nodes.find((node) => node.node_id === "fan");
+    expect(fan?.gateway_config).toBeDefined();
+    delete fan!.gateway_config!.result_contract;
+
+    const dispatcher = new FakeDAGDispatcher();
+    const executor = new GraphExecutor(dispatcher);
+    executor.createRun("fanout-evidence-contract-runtime-run", parsed, JSON.stringify([]));
+    executor.tick("fanout-evidence-contract-runtime-run");
+
+    const run = getActiveRun("fanout-evidence-contract-runtime-run");
+    expect(run?.status).toBe("failed");
+    expect(run?.dagRun.nodeStates.get("fan")).toBe("FAILED");
+    expect(run?.counters.abort_reason).toContain("DAG_FANOUT_RESULT_CONTRACT_REQUIRED");
+    expect(run?.dagRun.graph.nodes.some((node) => node.node_id.startsWith("fan__item_"))).toBe(false);
+    expect(dispatcher.dispatched).toEqual([]);
+  });
+
+  it("uses unique child ids and rejects stale children when fanout is entered again", () => {
+    const parsed = parseWorkflowSource(yaml("reentered-fanout", `
+contracts:
+  State: { type: object }
+agents:
+  worker: { system: Process one item. }
+nodes:
+  cycle:
+    kind: while
+    inputs: { state: { contract: State } }
+    outputs: { continue: { contract: State }, done: { contract: State }, exhausted: { contract: State } }
+    config:
+      field: context.stop
+      operator: eq
+      value: true
+      continue_port: continue
+      done_port: done
+      exhausted_port: exhausted
+      max_iterations: 2
+  fan:
+    kind: fanout
+    inputs: { plan: { contract: State } }
+    outputs: { passed: { contract: State }, failed: { contract: State } }
+    config:
+      input: plan
+      item_field: input.context.items
+      context_field: input.context
+      worker_agent: worker
+      max_items: 2
+      max_parallelism: 1
+      completion: all
+      result_port: passed
+      failed_port: failed
+  finished: { kind: terminal, outcome: success, inputs: { result: { contract: State } } }
+  exhausted: { kind: terminal, outcome: success, inputs: { result: { contract: State } } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: { contract: State } } }
+edges:
+  - { from: $run.input, to: cycle.state }
+  - { from: cycle.continue, to: fan.plan }
+  - kind: feedback
+    from: fan.passed
+    to: cycle.state
+    max_traversals: 2
+  - { from: cycle.done, to: finished.result }
+  - { from: cycle.exhausted, to: exhausted.result }
+  - { from: fan.failed, to: failed.result, condition: on_failure }
+`));
+    parsed.meta.agents!.worker.agent_type = "deterministic";
+    const dispatcher = new FakeDAGDispatcher();
+    const executor = new GraphExecutor(dispatcher);
+    executor.createRun("fanout-reentry-run", parsed, JSON.stringify({
+      context: { items: ["only"], stop: false },
+    }));
+
+    executor.tick("fanout-reentry-run");
+    expect(dispatcher.dispatched.map((entry) => entry.nodeId)).toEqual(["fan__item_0001"]);
+    handoffActiveRun("fanout-reentry-run", "fan__item_0001", "result", { status: "success" });
+    executor.tick("fanout-reentry-run");
+    expect(dispatcher.dispatched.map((entry) => entry.nodeId)).toEqual([
+      "fan__item_0001",
+      "fan__inv_0002__item_0001",
+    ]);
+    const run = getActiveRun("fanout-reentry-run");
+    expect(run?.counters.fanout_invocations.fan).toBe(2);
+    expect(run?.dagRun.graph.nodes.find((node) => node.node_id === "fan__inv_0002__item_0001")?.extra)
+      .toMatchObject({
+        dynamic_fanout: { parent_node: "fan", index: 0, invocation: 2 },
+        agent_runtime: {
+          allowed_builtin_tools: [],
+          allowed_dag_tools: ["handoff"],
+          workspace_access: { writable_paths: [], readonly_paths: ["input"] },
+        },
+      });
+  });
+
+  it("creates a fresh provider session whenever a dispatch-scoped reviewer is re-entered", () => {
+    const parsed = parseWorkflowSource(yaml("fresh-review-context", `
+contracts:
+  State:
+    type: object
+    properties: { approved: { type: boolean } }
+agents:
+  reviewer: { system: Review only the supplied candidate. }
+nodes:
+  cycle:
+    kind: while
+    inputs: { state: { contract: State } }
+    outputs: { continue: { contract: State }, done: { contract: State }, exhausted: { contract: State } }
+    config:
+      field: approved
+      operator: eq
+      value: true
+      continue_port: continue
+      done_port: done
+      exhausted_port: exhausted
+      max_iterations: 3
+  review:
+    kind: agent
+    agent: reviewer
+    session_scope: dispatch
+    inputs: { candidate: { contract: State } }
+    outputs: { reviewed: { contract: State } }
+  finished: { kind: terminal, outcome: success, inputs: { result: { contract: State } } }
+  exhausted: { kind: terminal, outcome: failure, inputs: { result: { contract: State } } }
+edges:
+  - { from: $run.input, to: cycle.state }
+  - { from: cycle.continue, to: review.candidate }
+  - kind: feedback
+    from: review.reviewed
+    to: cycle.state
+    max_traversals: 3
+  - { from: cycle.done, to: finished.result }
+  - { from: cycle.exhausted, to: exhausted.result, condition: on_failure }
+`));
+    parsed.meta.agents!.reviewer.agent_type = "deterministic";
+    const dispatcher = new FakeDAGDispatcher();
+    const executor = new GraphExecutor(dispatcher);
+    executor.createRun("fresh-review-run", parsed, JSON.stringify({ approved: false }));
+
+    executor.tick("fresh-review-run");
+    const firstSession = dispatcher.dispatched.at(-1)?.sessionId;
+    dispatcher.reset();
+    handoffActiveRun("fresh-review-run", "review", "reviewed", { approved: false });
+    expect(getCurrentNodeSession("fresh-review-run", "review")?.status).toBe("completed");
+    executor.tick("fresh-review-run");
+    expect(dispatcher.dispatched).toHaveLength(1);
+    const secondSession = dispatcher.dispatched.at(-1)?.sessionId;
+
+    expect(firstSession).toEqual(expect.any(String));
+    expect(secondSession).toEqual(expect.any(String));
+    expect(secondSession).not.toBe(firstSession);
+    expect(getCurrentNodeSession("fresh-review-run", "review")).toMatchObject({
+      sessionId: secondSession,
+      attempt: 2,
+      status: "running",
+    });
+  });
+
+  it("enforces max_nodes when a running DAG appends dynamic nodes", () => {
+    const parsed = parseWorkflowSource(yaml("bounded-dynamic-graph", `
+agents:
+  worker: { system: Work. }
+nodes:
+  work: { kind: agent, agent: worker, outputs: { done: {} } }
+  done: { kind: terminal, outcome: success, inputs: { result: {} } }
+edges:
+  - { from: work.done, to: done.result }
+`));
+    parsed.meta.limits = { ...(parsed.meta.limits ?? {}), max_nodes: 1 };
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun("bounded-dynamic-run", parsed);
+    expect(() => appendRunNode("bounded-dynamic-run", {
+      node: {
+        node_id: "extra",
+        name: "extra",
+        description: "must be rejected",
+        node_type: "agent",
+        agent: "worker",
+        after: [],
+        outputs: {},
+      },
+    })).toThrow("max_nodes (1) exceeded");
+  });
+
+  it("resolves distinct advisor runtime bindings in the executor envelope", () => {
+    const parsed = parseWorkflowSource(yaml("advisor-envelope", `
+contracts: { Task: { type: string } }
+agents:
+  executor: { system: Execute. }
+  expert: { system: Advise. }
+nodes:
+  execute:
+    kind: agent
+    agent: executor
+    advisors:
+      - { id: architecture, agent: expert, max_calls: 2, timeout_ms: 5000, max_tokens: 1000 }
+    inputs: { task: { contract: Task } }
+    outputs: { done: {} }
+  terminal: { kind: terminal, outcome: success, inputs: { result: {} } }
+edges:
+  - { from: $run.input, to: execute.task }
+  - { from: execute.done, to: terminal.result }
+`));
+    parsed.meta.agents!.executor = { ...parsed.meta.agents!.executor, agent_type: "deterministic", model: "executor-model" };
+    parsed.meta.agents!.expert = { ...parsed.meta.agents!.expert, agent_type: "deterministic", model: "advisor-model" };
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun("advisor-run", parsed, "task");
+    expect(buildCurrentDispatchEnvelope("advisor-run", "execute")).toMatchObject({
+      ok: true,
+      envelope: {
+        agentConfig: { model: "executor-model" },
+        advisors: [{ id: "architecture", agent_id: "expert", model: "advisor-model", max_calls: 2, calls_used: 0 }],
+      },
+    });
+    expect(recordAdvisorCall("advisor-run", "execute", "architecture")).toBe(1);
+    expect(buildCurrentDispatchEnvelope("advisor-run", "execute")).toMatchObject({
+      ok: true,
+      envelope: { advisors: [{ id: "architecture", max_calls: 2, calls_used: 1 }] },
+    });
+  });
+
+  it("delivers persisted event triggers idempotently", () => {
+    upsertDagWorkflowFromYaml({ yaml_text: yaml("triggered-check", `
+triggers:
+  push:
+    type: event
+    event: repo.push
+    overlap: allow
+    max_concurrency: 2
+agents: {}
+nodes:
+  check:
+    kind: command
+    outputs: { done: {}, failed: {} }
+    config:
+      command: [node, -e, process.exit(0)]
+      timeout_ms: 5000
+      success_port: done
+      failure_port: failed
+  terminal: { kind: terminal, outcome: success, inputs: { result: {} } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: check.done, to: terminal.result }
+  - { from: check.failed, to: failed.result, condition: on_failure }
+`) });
+    const orchestrator = new ChangeOrchestrator(new GraphExecutor(new FakeDAGDispatcher()));
+    const stop = startDagTriggerScheduler(orchestrator, 60_000);
+    try {
+      expect(listDagTriggers()).toHaveLength(1);
+      expect(fireDagEventTrigger("repo.push", "sha-1", { ref: "main" })[0]).toMatchObject({ dispatched: true });
+      expect(fireDagEventTrigger("repo.push", "sha-1", { ref: "main" })[0]).toMatchObject({ dispatched: false, reason: "duplicate" });
+      expect(listPersistedRunIds()).toHaveLength(1);
+    } finally {
+      stop();
+    }
+  });
+});

@@ -1,0 +1,586 @@
+import * as fs from "node:fs";
+import * as http from "node:http";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import { parseDAGYaml } from "../src/orchestration/yaml-loader.js";
+import { closeDb } from "../src/persistence/db.js";
+import { getDagRuntimeProfile, getDagWorkflow } from "../src/persistence/dag-workflows.js";
+import { _clearAllPersistence } from "../src/persistence/store.js";
+import { _clearActiveRuns, createActiveRun } from "../src/runtime/active-runs.js";
+import { createServer } from "../src/server/http.js";
+
+async function listen(server: http.Server): Promise<number> {
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const addr = server.address();
+  if (!addr || typeof addr !== "object") throw new Error("server did not bind");
+  return addr.port;
+}
+
+async function close(server: http.Server): Promise<void> {
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
+function createTestRun(runId: string): void {
+  const dag = parseDAGYaml(`
+name: active-list-test
+workflow_id: active-list-test
+agents:
+  worker:
+    agent_type: deterministic
+    system: HANDOFF port=done content=ok
+nodes:
+  work:
+    agent: worker
+    after: []
+    outputs:
+      done:
+        to: ""
+`);
+  createActiveRun(runId, dag);
+}
+
+describe("settings bootstrap routes", () => {
+  let server: http.Server;
+  let tmpHome: string;
+  let oldHome: string | undefined;
+  let oldAssetDir: string | undefined;
+
+  beforeEach(() => {
+    oldHome = process.env.ATMS_HOME;
+    oldAssetDir = process.env.ATMS_ASSET_DIR;
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "atms-settings-bootstrap-"));
+    process.env.ATMS_HOME = tmpHome;
+    delete process.env.ATMS_ASSET_DIR;
+    _clearActiveRuns();
+    _clearAllPersistence();
+    server = createServer(0, undefined, undefined, false);
+  });
+
+  afterEach(async () => {
+    _clearActiveRuns();
+    _clearAllPersistence();
+    await close(server);
+    if (oldHome === undefined) {
+      delete process.env.ATMS_HOME;
+    } else {
+      process.env.ATMS_HOME = oldHome;
+    }
+    if (oldAssetDir === undefined) {
+      delete process.env.ATMS_ASSET_DIR;
+    } else {
+      process.env.ATMS_ASSET_DIR = oldAssetDir;
+    }
+    closeDb();
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  it("returns the merged Atms skill catalog and skill contents", async () => {
+    const customDir = path.join(tmpHome, "skills", "custom-runtime-skill");
+    fs.mkdirSync(customDir, { recursive: true });
+    fs.writeFileSync(path.join(customDir, "SKILL.md"), [
+      "---",
+      "name: custom-runtime-skill",
+      "description: Runtime custom skill",
+      "---",
+      "",
+      "# Runtime custom skill",
+    ].join("\n"));
+    const port = await listen(server);
+    const response = await fetch(`http://127.0.0.1:${port}/api/skills`);
+    const body = await response.json() as {
+      success: boolean;
+      data: { total: number; root: string; skills: Array<{ id: string; relative_path: string; source: string }> };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(body.data.total).toBeGreaterThan(0);
+    expect(body.data.skills.map((skill) => skill.id)).toContain("atms-dag-ops");
+    expect(body.data.skills).toContainEqual(expect.objectContaining({
+      id: "custom-runtime-skill",
+      source: "home",
+    }));
+    expect(body.data.root).toBe(path.join(tmpHome, "skills"));
+    expect(body.data.skills.every((skill) => !path.isAbsolute(skill.relative_path))).toBe(true);
+
+    const detailResponse = await fetch(`http://127.0.0.1:${port}/api/skills/custom-runtime-skill`);
+    const detail = await detailResponse.json() as { data: { content: string; description: string } };
+    expect(detailResponse.status).toBe(200);
+    expect(detail.data.description).toBe("Runtime custom skill");
+    expect(detail.data.content).toContain("# Runtime custom skill");
+
+    const traversal = await fetch(`http://127.0.0.1:${port}/api/skills/%2E%2E%5Csecrets`);
+    expect(traversal.status).toBe(404);
+  });
+
+  it("materializes only validated local Skill view templates from semantic data", async () => {
+    const skillDir = path.join(tmpHome, "skills", "route-skill");
+    const viewDir = path.join(skillDir, "assets", "atms");
+    fs.mkdirSync(viewDir, { recursive: true });
+    fs.writeFileSync(path.join(skillDir, "SKILL.md"), [
+      "---",
+      "name: route-skill",
+      "description: Render verified routes",
+      "---",
+      "",
+      "# Route skill",
+    ].join("\n"));
+    fs.writeFileSync(path.join(viewDir, "view-templates.json"), JSON.stringify({
+      manifest_version: 1,
+      presenter: {
+        command: "node",
+        args: ["presenter.js"],
+        timeout_ms: 5000,
+      },
+      templates: [{
+        id: "route",
+        description: "Show one verified route.",
+        data_schema: {
+          type: "object",
+          properties: {
+            title: { type: "string", minLength: 1, maxLength: 200 },
+            steps: { type: "array", maxItems: 12, items: { type: "string", maxLength: 200 } },
+          },
+          required: ["title", "steps"],
+          additionalProperties: false,
+        },
+        a2ui: {
+          version: "v1.0",
+          catalogId: "https://atms.dev/a2ui/catalogs/core/v1",
+          components: [
+            { id: "root", component: "Column", children: ["title"] },
+            { id: "title", component: "Text", text: { path: "/data/title" } },
+          ],
+        },
+        defaults: {
+          surface: "result",
+          importance: "primary",
+          density: "summary",
+          canvas_size: "1x2",
+          persistence: "session",
+        },
+        allowed_canvas_sizes: ["1x2", "2x2"],
+      }],
+    }));
+    fs.writeFileSync(path.join(skillDir, "presenter.js"), [
+      "const [start, finish] = process.argv.slice(2);",
+      "if (['dag', 'escape', 'workflow-mismatch', 'profile-mismatch', 'symlink-escape'].includes(start)) {",
+      "  process.stdout.write(JSON.stringify({",
+      "    mode: 'supervised_dag',",
+      "    workflow_id: 'skill-dag',",
+      "    workflow_path: start === 'escape' ? '../../secret.yaml' : start === 'workflow-mismatch' ? 'assets/atms/mismatched-workflow.yaml' : start === 'symlink-escape' ? 'assets/atms/linked-workflow.yaml' : 'assets/atms/workflow.yaml',",
+      "    profile_id: 'skill-profile',",
+      "    profile_path: start === 'profile-mismatch' ? 'assets/atms/mismatched-profile.yaml' : 'assets/atms/profile.yaml',",
+      "    workflow_prompt: 'verified mission',",
+      "    response_text: 'Workers started.',",
+      "  }));",
+      "  return;",
+      "}",
+      "process.stdout.write(JSON.stringify({",
+      "  template: 'route',",
+      "  id: `route-${start}-${finish}`,",
+      "  canvas_size: '1x2',",
+      "  data: { title: `${start} to ${finish}`, steps: [start, finish] },",
+      "  response_text: `${start} reaches ${finish}.`,",
+      "}));",
+    ].join("\n"));
+    fs.writeFileSync(path.join(viewDir, "workflow.yaml"), [
+      "name: skill-dag",
+      "workflow_id: skill-dag",
+      "agents:",
+      "  worker:",
+      "    agent_type: claude-sdk",
+      "    system: HANDOFF port=done content=ok",
+      "nodes:",
+      "  work:",
+      "    agent: worker",
+      "    after: []",
+      "    outputs:",
+      "      done:",
+      "        to: ''",
+    ].join("\n"));
+    fs.writeFileSync(path.join(viewDir, "profile.yaml"), [
+      "profile_id: skill-profile",
+      "workflow_id: skill-dag",
+      "default:",
+      "  agent_type: claude-sdk",
+    ].join("\n"));
+    fs.writeFileSync(path.join(viewDir, "mismatched-workflow.yaml"), [
+      "name: another-dag",
+      "workflow_id: another-dag",
+      "agents: {}",
+      "nodes: {}",
+    ].join("\n"));
+    fs.writeFileSync(path.join(viewDir, "mismatched-profile.yaml"), [
+      "profile_id: skill-profile",
+      "workflow_id: another-dag",
+      "default:",
+      "  agent_type: claude-sdk",
+    ].join("\n"));
+    fs.writeFileSync(path.join(tmpHome, "secret.yaml"), "workflow_id: escaped\n");
+    if (process.platform !== "win32") {
+      fs.symlinkSync(path.join(tmpHome, "secret.yaml"), path.join(viewDir, "linked-workflow.yaml"));
+    }
+
+    const port = await listen(server);
+    const response = await fetch(
+      `http://127.0.0.1:${port}/api/skills/route-skill/views/route/materialize`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: "route-result",
+          canvas_size: "2x2",
+          data: { title: "Verified route", steps: ["start", "finish"] },
+        }),
+      },
+    );
+    const body = await response.json() as {
+      success: boolean;
+      data: { input: Record<string, unknown> };
+    };
+    expect(response.status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(body.data.input).toMatchObject({
+      id: "route-result",
+      title: "Verified route",
+      canvas_size: "2x2",
+      content: { data: { title: "Verified route", steps: ["start", "finish"] } },
+    });
+    expect((body.data.input.a2ui as Record<string, unknown>).components).toEqual([
+      { id: "root", component: "Column", children: ["title"] },
+      { id: "title", component: "Text", text: { path: "/data/title" } },
+    ]);
+
+    const presentedResponse = await fetch(
+      `http://127.0.0.1:${port}/api/skills/route-skill/views/present`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ argv: ["start", "finish"] }),
+      },
+    );
+    const presented = await presentedResponse.json() as {
+      success: boolean;
+      data: { input: Record<string, unknown>; template_id: string; response_text: string };
+    };
+    expect(presentedResponse.status).toBe(200);
+    expect(presented.success).toBe(true);
+    expect(presented.data).toMatchObject({
+      template_id: "route",
+      response_text: "start reaches finish.",
+      input: {
+        id: "route-start-finish",
+        title: "start to finish",
+        canvas_size: "1x2",
+        content: { data: { title: "start to finish", steps: ["start", "finish"] } },
+      },
+    });
+
+    const dagResponse = await fetch(
+      `http://127.0.0.1:${port}/api/skills/route-skill/views/present`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ argv: ["dag"] }),
+      },
+    );
+    const dagPresented = await dagResponse.json() as {
+      success: boolean;
+      data: Record<string, unknown>;
+    };
+    expect(dagResponse.status).toBe(200);
+    expect(dagPresented.data).toMatchObject({
+      mode: "supervised_dag",
+      launch: {
+        workflow_id: "skill-dag",
+        profile: "skill-profile",
+        prompt: "verified mission",
+        workflow_revision: 1,
+        canonical_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        profile_updated_at: expect.any(String),
+      },
+      workflow_revision: 1,
+      response_text: "Workers started.",
+    });
+    expect(getDagWorkflow("skill-dag")?.source_path).toBe("skill:route-skill/assets/atms/workflow.yaml");
+    expect(getDagRuntimeProfile("skill-dag", "skill-profile")?.source_path)
+      .toBe("skill:route-skill/assets/atms/profile.yaml");
+
+    const escapedDag = await fetch(
+      `http://127.0.0.1:${port}/api/skills/route-skill/views/present`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ argv: ["escape"] }),
+      },
+    );
+    expect(escapedDag.status).toBe(400);
+
+    const workflowBeforeMismatch = getDagWorkflow("skill-dag");
+    const mismatchedWorkflow = await fetch(
+      `http://127.0.0.1:${port}/api/skills/route-skill/views/present`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ argv: ["workflow-mismatch"] }),
+      },
+    );
+    expect(mismatchedWorkflow.status).toBe(400);
+    expect(getDagWorkflow("skill-dag")).toEqual(workflowBeforeMismatch);
+    expect(getDagWorkflow("another-dag")).toBeUndefined();
+
+    const profileBeforeMismatch = getDagRuntimeProfile("skill-dag", "skill-profile");
+    const mismatchedProfile = await fetch(
+      `http://127.0.0.1:${port}/api/skills/route-skill/views/present`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ argv: ["profile-mismatch"] }),
+      },
+    );
+    expect(mismatchedProfile.status).toBe(400);
+    expect(getDagWorkflow("skill-dag")).toEqual(workflowBeforeMismatch);
+    expect(getDagRuntimeProfile("skill-dag", "skill-profile")).toEqual(profileBeforeMismatch);
+
+    if (process.platform !== "win32") {
+      const symlinkEscape = await fetch(
+        `http://127.0.0.1:${port}/api/skills/route-skill/views/present`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ argv: ["symlink-escape"] }),
+        },
+      );
+      expect(symlinkEscape.status).toBe(400);
+    }
+
+    const invalidArgv = await fetch(
+      `http://127.0.0.1:${port}/api/skills/route-skill/views/present`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ argv: ["start\nunsafe", "finish"] }),
+      },
+    );
+    expect(invalidArgv.status).toBe(400);
+
+    const invalid = await fetch(
+      `http://127.0.0.1:${port}/api/skills/route-skill/views/route/materialize`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: "route-result", data: { title: "Missing steps" } }),
+      },
+    );
+    expect(invalid.status).toBe(400);
+
+    const missing = await fetch(
+      `http://127.0.0.1:${port}/api/skills/route-skill/views/missing/materialize`,
+      { method: "POST", body: "{}" },
+    );
+    expect(missing.status).toBe(404);
+
+    const traversal = await fetch(
+      `http://127.0.0.1:${port}/api/skills/%2E%2E%2Fsecrets/views/route/materialize`,
+      { method: "POST", body: "{}" },
+    );
+    expect(traversal.status).toBe(404);
+  });
+
+  it("returns asset diagnostics with concrete checks", async () => {
+    const port = await listen(server);
+    const response = await fetch(`http://127.0.0.1:${port}/api/assets/diagnostics`);
+    const body = await response.json() as {
+      success: boolean;
+      data: {
+        status: string;
+        asset_root: string;
+        subdirs: Record<string, { exists: boolean; path: string }>;
+        checks: Array<{ name: string; present: boolean; count: number }>;
+      };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(body.data.status).toBe("healthy");
+    expect(body.data.asset_root).toContain("assets");
+    expect(body.data.subdirs.orchestrations.exists).toBe(true);
+    expect(body.data.checks.find((check) => check.name === "orchestration_templates")?.count).toBeGreaterThan(0);
+  });
+
+  it("falls back to built-in orchestrations when HOME only overrides skills", async () => {
+    fs.mkdirSync(path.join(tmpHome, "asset", "skills", "custom-skill"), { recursive: true });
+    const port = await listen(server);
+
+    const diagnosticsResponse = await fetch(`http://127.0.0.1:${port}/api/assets/diagnostics`);
+    const diagnostics = await diagnosticsResponse.json() as {
+      data: { subdirs: Record<string, { exists: boolean; path: string }> };
+    };
+    expect(diagnostics.data.subdirs.orchestrations.exists).toBe(true);
+    expect(diagnostics.data.subdirs.orchestrations.path).toContain(path.join("assets", "orchestrations"));
+
+    const templatesResponse = await fetch(`http://127.0.0.1:${port}/api/manage/orchestrations`);
+    const templates = await templatesResponse.json() as {
+      data: { orchestrations: Array<{ id: string }> };
+    };
+    expect(templates.data.orchestrations).toContainEqual(expect.objectContaining({ id: "pr-review" }));
+  });
+
+  it("returns asset diagnostics from ATMS_ASSET_DIR when configured", async () => {
+    const assetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "atms-manager-assets-"));
+    try {
+      fs.mkdirSync(path.join(assetRoot, "orchestrations"), { recursive: true });
+      fs.mkdirSync(path.join(assetRoot, "providers"), { recursive: true });
+      fs.mkdirSync(path.join(assetRoot, "agents"), { recursive: true });
+      fs.mkdirSync(path.join(assetRoot, "skills"), { recursive: true });
+      fs.mkdirSync(path.join(assetRoot, "prompts"), { recursive: true });
+      fs.writeFileSync(path.join(assetRoot, "orchestrations", "external.yaml.template"), `
+name: external-manager-template
+nodes:
+  only:
+    agent: worker
+    after: []
+`);
+      fs.writeFileSync(path.join(assetRoot, "providers", "external.yaml.template"), "id: external\n");
+      process.env.ATMS_ASSET_DIR = assetRoot;
+
+      const port = await listen(server);
+      const response = await fetch(`http://127.0.0.1:${port}/api/assets/diagnostics`);
+      const body = await response.json() as {
+        success: boolean;
+        data: {
+          asset_root: string;
+          source: string;
+          checks: Array<{ name: string; count: number }>;
+        };
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.success).toBe(true);
+      expect(body.data.asset_root).toBe(assetRoot);
+      expect(body.data.source).toBe("env");
+      expect(body.data.checks.find((check) => check.name === "orchestration_templates")?.count).toBe(1);
+    } finally {
+      fs.rmSync(assetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("returns public orchestration templates for the Agent UI diagnostics panel", async () => {
+    const port = await listen(server);
+    const response = await fetch(`http://127.0.0.1:${port}/api/manage/orchestrations`);
+    const body = await response.json() as {
+      success: boolean;
+      data: {
+        total: number;
+        orchestrations: Array<{
+          id: string;
+          path: string;
+          category: string;
+          node_count: number;
+          supported_profiles: string[];
+        }>;
+      };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(body.data.total).toBeGreaterThan(0);
+    expect(body.data.orchestrations.every((item) => item.category === "primary")).toBe(true);
+    expect(body.data.orchestrations.every((item) => !path.isAbsolute(item.path))).toBe(true);
+    expect(body.data.orchestrations.some((item) => item.node_count > 0 || item.supported_profiles.length > 0)).toBe(true);
+  });
+
+  it("returns empty experience graph summary instead of the old unsupported response", async () => {
+    const port = await listen(server);
+    const response = await fetch(`http://127.0.0.1:${port}/api/experience/graph/summary?limit=12`);
+    const body = await response.json() as {
+      success: boolean;
+      data: {
+        available: boolean;
+        node_count: number;
+        relationship_count: number;
+        structure_coverage: { status: string };
+        recent_runs: unknown[];
+      };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(body.data.available).toBe(false);
+    expect(body.data.node_count).toBe(0);
+    expect(body.data.relationship_count).toBe(0);
+    expect(body.data.structure_coverage.status).toBe("empty");
+    expect(body.data.recent_runs).toEqual([]);
+  });
+
+  it("derives experience graph and DAG context from persisted run metadata", async () => {
+    const port = await listen(server);
+    createTestRun("active-run-1");
+
+    const summaryResponse = await fetch(`http://127.0.0.1:${port}/api/experience/graph/summary?limit=12`);
+    const summary = await summaryResponse.json() as {
+      success: boolean;
+      data: { available: boolean; run_count: number; recent_runs: Array<{ run_id: string; status: string }> };
+    };
+    expect(summaryResponse.status).toBe(200);
+    expect(summary.success).toBe(true);
+    expect(summary.data.available).toBe(true);
+    expect(summary.data.run_count).toBe(1);
+    expect(summary.data.recent_runs[0]).toMatchObject({ run_id: "active-run-1", status: "active" });
+
+    const graphResponse = await fetch(`http://127.0.0.1:${port}/api/experience/graph?query=active-list-test`);
+    const graph = await graphResponse.json() as {
+      success: boolean;
+      data: { nodes: Array<{ type: string }>; edges: Array<{ type: string }> };
+    };
+    expect(graphResponse.status).toBe(200);
+    expect(graph.success).toBe(true);
+    expect(graph.data.nodes.some((node) => node.type === "Run")).toBe(true);
+    expect(graph.data.edges.some((edge) => edge.type === "UsedTemplate")).toBe(true);
+
+    const contextResponse = await fetch(`http://127.0.0.1:${port}/api/experience/dag-context`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "active-list-test", limit: 4 }),
+    });
+    const context = await contextResponse.json() as {
+      success: boolean;
+      data: { prompt_context: string; matched_items: unknown[]; template_stats: Array<{ template: string }> };
+    };
+    expect(contextResponse.status).toBe(200);
+    expect(context.success).toBe(true);
+    expect(context.data.prompt_context).toContain("Run experience graph available");
+    expect(context.data.matched_items.length).toBeGreaterThan(0);
+    expect(context.data.template_stats.some((item) => item.template === "active-list-test")).toBe(true);
+  });
+
+  it("returns unsupported for unavailable compatibility surfaces", async () => {
+    const port = await listen(server);
+    const response = await fetch(`http://127.0.0.1:${port}/api/settings/workspace/directory-support`);
+    const body = await response.json() as { success: boolean; data: { code: string; supported: boolean } };
+
+    expect(response.status).toBe(501);
+    expect(body.success).toBe(false);
+    expect(body.data.code).toBe("DIRECTORY_IMPORT_UNSUPPORTED");
+    expect(body.data.supported).toBe(false);
+  });
+
+  it("returns actual active runs instead of an empty dashboard default", async () => {
+    const port = await listen(server);
+    createTestRun("active-run-1");
+
+    const response = await fetch(`http://127.0.0.1:${port}/api/runs/active/list`);
+    const body = await response.json() as {
+      success: boolean;
+      data: { total: number; runs: Array<{ runId: string; status: string }> };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(body.data.total).toBe(1);
+    expect(body.data.runs[0]).toMatchObject({ runId: "active-run-1", status: "active" });
+  });
+});

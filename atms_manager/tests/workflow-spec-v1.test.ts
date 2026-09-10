@@ -1,0 +1,1034 @@
+import { describe, expect, it } from "vitest";
+import YAML from "yaml";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { Value } from "@sinclair/typebox/value";
+import {
+  canonicalWorkflowToV1Document,
+  compileWorkflowSource,
+  parseWorkflowSourceFile,
+  projectCanonicalWorkflowToParsedDAG,
+} from "../src/orchestration/workflow-spec-v1.js";
+import { WorkflowSpecV1Schema } from "../src/orchestration/workflow-spec-v1-schema.js";
+
+const PUBLIC_V1_ASSETS = [
+  "workflow-spec-v1-minimal.yaml.template",
+  "workflow-spec-v1-fanout.yaml.template",
+  "workflow-spec-v1-condition.yaml.template",
+  "workflow-spec-v1-foreach.yaml.template",
+  "workflow-spec-v1-bounded-while.yaml.template",
+] as const;
+
+const MINIMAL_WORKFLOW = {
+  api_version: "atms.ai/v1",
+  kind: "Workflow",
+  metadata: {
+    id: "bounded-review",
+    name: "Bounded Review",
+  },
+  spec: {
+    description: "Execute one task and finish with explicit evidence.",
+    workspace: { mode: "isolated" },
+    contracts: {
+      Task: {
+        type: "object",
+        additionalProperties: false,
+        required: ["objective"],
+        properties: { objective: { type: "string", maxLength: 1000 } },
+      },
+      Result: {
+        type: "object",
+        additionalProperties: false,
+        required: ["status"],
+        properties: { status: { type: "string", enum: ["success", "failure"] } },
+      },
+    },
+    agents: {
+      worker: {
+        system: "Execute the supplied task and return structured evidence.",
+        skills: ["atms-dag-ops"],
+      },
+    },
+    nodes: {
+      execute: {
+        kind: "agent",
+        agent: "worker",
+        inputs: { task: { contract: "Task" } },
+        outputs: { result: { contract: "Result" } },
+      },
+      done: {
+        kind: "terminal",
+        outcome: "success",
+        inputs: { result: { contract: "Result" } },
+      },
+    },
+    edges: [
+      { from: "$run.input", to: "execute.task" },
+      { from: "execute.result", to: "done.result" },
+    ],
+  },
+} as const;
+
+function awaitCommandWorkflow(): any {
+  return {
+    api_version: "atms.ai/v1",
+    kind: "Workflow",
+    metadata: { id: "multi-round", name: "Multi Round" },
+    spec: {
+      agents: { worker: { system: "Work." } },
+      nodes: {
+        actor: {
+          kind: "agent",
+          agent: "worker",
+          outputs: { summary: {} },
+        },
+        suspend: {
+          kind: "await_command",
+          inputs: { summary: {} },
+          config: {
+            primitive_version: 1,
+            target_actors: ["actor"],
+            expires_after_ms: 60_000,
+            command_port: "next_command",
+          },
+        },
+      },
+      edges: [
+        { from: "actor.summary", to: "suspend.summary" },
+      ],
+    },
+  };
+}
+
+describe("WorkflowSpec v1", () => {
+  it("compiles a Manager-only broker gateway with one exact declared action", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.nodes.validate = {
+      kind: "broker",
+      inputs: { candidate: {} },
+      outputs: { result: {}, error: {} },
+      config: {
+        input: "candidate",
+        input_map: { expected_head_sha: "head_sha" },
+        static_input: { mode: "trusted" },
+        credential_ref: "github-autofix",
+        purpose: "validate one immutable PR head",
+        broker: "github_pr",
+        action: "validate_head",
+        result_port: "result",
+        error_port: "error",
+      },
+    };
+    workflow.spec.nodes.failed = {
+      kind: "terminal",
+      outcome: "failure",
+      inputs: { result: {} },
+    };
+    workflow.spec.edges = [
+      { from: "$run.input", to: "execute.task" },
+      { from: "execute.result", to: "validate.candidate" },
+      { from: "validate.result", to: "done.result" },
+      { from: "validate.error", to: "failed.result", condition: "on_failure" },
+    ];
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid, result.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    const runtime = projectCanonicalWorkflowToParsedDAG(result.canonical!);
+    expect(runtime.graph.nodes.find((node) => node.node_id === "validate")).toMatchObject({
+      node_type: "broker_gateway",
+      gateway_config: {
+        input: "candidate",
+        input_map: { expected_head_sha: "head_sha" },
+        static_input: { mode: "trusted" },
+        credential_ref: "github-autofix",
+        broker: "github_pr",
+        action: "validate_head",
+        result_port: "result",
+        error_port: "error",
+      },
+      extra: {
+        agent_runtime: {
+          credentials: [{
+            credential_ref: "github-autofix",
+            inject: { mode: "manager_broker", broker: "github_pr", allowed_actions: ["validate_head"] },
+          }],
+        },
+      },
+    });
+  });
+
+  it("canonicalizes exact per-agent pinned Surface view allowlists", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.agents.worker.allowed_surface_views = ["review:summary", "summary"];
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid, result.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(result.canonical?.agents.worker.allowed_surface_views).toEqual([
+      "review:summary",
+      "summary",
+    ]);
+    expect(projectCanonicalWorkflowToParsedDAG(result.canonical!).meta.agents?.worker)
+      .toMatchObject({ allowed_surface_views: ["review:summary", "summary"] });
+
+    workflow.spec.agents.worker.allowed_surface_views.reverse();
+    expect(compileWorkflowSource(YAML.stringify(workflow)).canonical_hash).toBe(result.canonical_hash);
+  });
+
+  it("rejects duplicate or malformed pinned Surface view allowlists", () => {
+    for (const allowedSurfaceViews of [["summary", "summary"], ["bad view"]]) {
+      const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+      workflow.spec.agents.worker.allowed_surface_views = allowedSurfaceViews;
+      const result = compileWorkflowSource(YAML.stringify(workflow));
+      expect(result.valid).toBe(false);
+      expect(result.diagnostics).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "DAG_SCHEMA_INVALID_FIELD" }),
+      ]));
+    }
+  });
+
+  it("canonicalizes strict per-agent built-in tool allowlists", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.nodes.execute.allowed_builtin_tools = ["Write", "Read"];
+    workflow.spec.nodes.execute.allowed_dag_tools = ["handoff", "get_graph_context", "report_surface_state"];
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid, result.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(result.canonical?.nodes.find((node) => node.id === "execute")?.config).toMatchObject({
+      allowed_builtin_tools: ["Read", "Write"],
+      allowed_dag_tools: ["get_graph_context", "handoff", "report_surface_state"],
+    });
+
+    workflow.spec.nodes.execute.allowed_builtin_tools.reverse();
+    workflow.spec.nodes.execute.allowed_dag_tools.reverse();
+    expect(compileWorkflowSource(YAML.stringify(workflow)).canonical_hash).toBe(result.canonical_hash);
+  });
+
+  it("rejects duplicate or unknown built-in tool names", () => {
+    for (const allowedBuiltinTools of [["Write", "Write"], ["Write", "UnknownTool"]]) {
+      const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+      workflow.spec.nodes.execute.allowed_builtin_tools = allowedBuiltinTools;
+      const result = compileWorkflowSource(YAML.stringify(workflow));
+      expect(result.valid).toBe(false);
+      expect(result.diagnostics).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "DAG_SCHEMA_INVALID_FIELD" }),
+      ]));
+    }
+  });
+
+  it("canonicalizes explicit backend-native tools and rejects ambiguous or unbounded declarations", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.nodes.execute.builtin_tool_policy = "backend_native";
+    workflow.spec.nodes.execute.workspace_access = { writable_paths: ["repo"], readonly_paths: ["input"] };
+
+    const valid = compileWorkflowSource(YAML.stringify(workflow));
+    expect(valid.valid, valid.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(valid.canonical?.nodes.find((node) => node.id === "execute")?.config).toMatchObject({
+      builtin_tool_policy: "backend_native",
+      workspace_access: { writable_paths: ["repo"], readonly_paths: ["input"] },
+    });
+
+    const authorExcluded = structuredClone(workflow);
+    authorExcluded.spec.nodes.execute.workspace_access.snapshot_exclude_paths = ["repo/private"];
+    const authorExcludedResult = compileWorkflowSource(YAML.stringify(authorExcluded));
+    expect(authorExcludedResult.valid).toBe(false);
+    expect(authorExcludedResult.diagnostics).toContainEqual(expect.objectContaining({
+      code: "DAG_SCHEMA_INVALID_FIELD",
+      path: "/spec/nodes/execute",
+    }));
+
+    workflow.spec.nodes.execute.allowed_builtin_tools = ["Write"];
+    const ambiguous = compileWorkflowSource(YAML.stringify(workflow));
+    expect(ambiguous.valid).toBe(false);
+    expect(ambiguous.diagnostics).toContainEqual(expect.objectContaining({
+      code: "DAG_SEMANTIC_BUILTIN_TOOL_POLICY_CONFLICT",
+    }));
+
+    delete workflow.spec.nodes.execute.allowed_builtin_tools;
+    delete workflow.spec.nodes.execute.workspace_access;
+    const unbounded = compileWorkflowSource(YAML.stringify(workflow));
+    expect(unbounded.valid).toBe(false);
+    expect(unbounded.diagnostics).toContainEqual(expect.objectContaining({
+      code: "DAG_SEMANTIC_BACKEND_NATIVE_WORKSPACE_REQUIRED",
+    }));
+  });
+
+  it("requires one explicit writable root for a read-only Git metadata overlay", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.nodes.execute.workspace_access = {
+      writable_paths: ["repo"],
+      readonly_paths: ["input"],
+      git_metadata_read_only: true,
+    };
+
+    const valid = compileWorkflowSource(YAML.stringify(workflow));
+    expect(valid.valid, valid.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(valid.canonical?.nodes.find((node) => node.id === "execute")?.config.workspace_access)
+      .toMatchObject({ git_metadata_read_only: true });
+
+    workflow.spec.nodes.execute.workspace_access.writable_paths = [];
+    const missingRoot = compileWorkflowSource(YAML.stringify(workflow));
+    expect(missingRoot.valid).toBe(false);
+    expect(missingRoot.diagnostics).toContainEqual(expect.objectContaining({
+      code: "DAG_SEMANTIC_GIT_METADATA_WRITE_BOUNDARY_REQUIRED",
+    }));
+
+    workflow.spec.nodes.execute.workspace_access.writable_paths = ["."];
+    const wholeWorkspace = compileWorkflowSource(YAML.stringify(workflow));
+    expect(wholeWorkspace.valid).toBe(false);
+    expect(wholeWorkspace.diagnostics).toContainEqual(expect.objectContaining({
+      code: "DAG_SEMANTIC_GIT_METADATA_WRITE_BOUNDARY_REQUIRED",
+    }));
+  });
+
+  it("rejects runtime-owned workspace policy paths during compilation", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.nodes.execute.workspace_access = {
+      writable_paths: [".atms-runtime"],
+      readonly_paths: ["repo/.git"],
+    };
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid).toBe(false);
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: "DAG_SEMANTIC_RESERVED_WORKSPACE_PATH",
+        path: "/spec/nodes/execute/workspace_access/writable_paths/0",
+        hint: expect.stringContaining("Remove this path"),
+      }),
+      expect.objectContaining({
+        code: "DAG_SEMANTIC_RESERVED_WORKSPACE_PATH",
+        path: "/spec/nodes/execute/workspace_access/readonly_paths/0",
+      }),
+    ]));
+  });
+
+  it("canonicalizes explicit Codex sandbox policy and rejects maximum access for read-only nodes", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.nodes.execute.builtin_tool_policy = "backend_native";
+    workflow.spec.nodes.execute.workspace_access = { writable_paths: ["repo"], readonly_paths: ["input"] };
+    workflow.spec.nodes.execute.codex_sandbox = "danger-full-access";
+
+    const valid = compileWorkflowSource(YAML.stringify(workflow));
+    expect(valid.valid, valid.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(valid.canonical?.nodes.find((node) => node.id === "execute")?.config).toMatchObject({
+      codex_sandbox: "danger-full-access",
+    });
+    expect(canonicalWorkflowToV1Document(valid.canonical!).spec.nodes.execute).toMatchObject({
+      codex_sandbox: "danger-full-access",
+    });
+
+    workflow.spec.nodes.execute.workspace_access = { writable_paths: [], readonly_paths: ["input"] };
+    const readOnly = compileWorkflowSource(YAML.stringify(workflow));
+    expect(readOnly.valid).toBe(false);
+    expect(readOnly.diagnostics).toContainEqual(expect.objectContaining({
+      code: "DAG_SEMANTIC_CODEX_SANDBOX_WRITABLE_WORKSPACE_REQUIRED",
+    }));
+  });
+
+  it("requires output-producing agents to retain the handoff DAG tool", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.nodes.execute.allowed_dag_tools = ["get_graph_context"];
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid).toBe(false);
+    expect(result.diagnostics).toContainEqual(expect.objectContaining({
+      code: "DAG_SEMANTIC_HANDOFF_TOOL_REQUIRED",
+      path: "/spec/nodes/execute/allowed_dag_tools",
+    }));
+  });
+
+  it("canonicalizes conditional Manager-broker handoff requirements and rejects undeclared actions", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.nodes.execute.allowed_dag_tools = ["handoff", "credential_broker_call"];
+    workflow.spec.nodes.execute.credentials = [{
+      credential_ref: "github-autofix",
+      purpose: "verify the bound pull request",
+      inject: {
+        mode: "manager_broker",
+        broker: "github_pr",
+        allowed_actions: ["required_checks"],
+      },
+    }];
+    workflow.spec.nodes.execute.outputs.result.required_broker_actions = [{
+      credential_ref: "github-autofix",
+      broker: "github_pr",
+      action: "required_checks",
+      when: { field: "status", equals: "success" },
+      result_binding: { result_field: "head_sha", content_field: "head_sha" },
+    }];
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+    expect(result.valid, result.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    const requirement = [{
+      credential_ref: "github-autofix",
+      broker: "github_pr",
+      action: "required_checks",
+      when: { field: "status", equals: "success" },
+      result_binding: { result_field: "head_sha", content_field: "head_sha" },
+    }];
+    expect(result.canonical?.nodes.find((node) => node.id === "execute")?.outputs)
+      .toContainEqual(expect.objectContaining({ name: "result", required_broker_actions: requirement }));
+    expect(projectCanonicalWorkflowToParsedDAG(result.canonical!).graph.nodes
+      .find((node) => node.node_id === "execute")?.extra?.workflow_spec_v1)
+      .toMatchObject({ output_broker_requirements: { result: requirement } });
+    expect((canonicalWorkflowToV1Document(result.canonical!) as any).spec.nodes.execute.outputs.result)
+      .toMatchObject({ required_broker_actions: requirement });
+
+    workflow.spec.nodes.execute.outputs.result.required_broker_actions[0].action = "commit_files";
+    const invalid = compileWorkflowSource(YAML.stringify(workflow));
+    expect(invalid.valid).toBe(false);
+    expect(invalid.diagnostics).toContainEqual(expect.objectContaining({
+      code: "DAG_SEMANTIC_UNDECLARED_BROKER_REQUIREMENT",
+      path: "/spec/nodes/execute/outputs/result/required_broker_actions/0",
+    }));
+  });
+
+  it("accepts bounded conditional contract invariants", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.contracts.Result = {
+      type: "object",
+      additionalProperties: false,
+      required: ["status", "evidence"],
+      properties: {
+        status: { type: "string", enum: ["confirmed", "inconclusive"] },
+        evidence: { type: "array", items: { type: "string" } },
+      },
+      allOf: [{
+        if: { required: ["status"], properties: { status: { const: "confirmed" } } },
+        then: {
+          properties: {
+            evidence: { type: "array", contains: { type: "string", const: "executable" } },
+          },
+        },
+        else: { properties: { evidence: { type: "array" } } },
+      }],
+    };
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+    expect(result.valid).toBe(true);
+    expect(result.diagnostics.filter((entry) => entry.severity === "error")).toEqual([]);
+  });
+
+  it("defines a strict schema branch for every v1 node kind", () => {
+    const document = {
+      api_version: "atms.ai/v1",
+      kind: "Workflow",
+      metadata: { id: "all-node-kinds", name: "All Node Kinds" },
+      spec: {
+        contracts: { Data: { type: "object" } },
+        agents: { worker: { system: "Work." } },
+        nodes: {
+          worker: {
+            kind: "agent",
+            agent: "worker",
+            inputs: { task: { contract: "Data" } },
+            outputs: { result: { contract: "Data" } },
+          },
+          gate: {
+            kind: "condition",
+            inputs: { signal: { contract: "Data" } },
+            outputs: { yes: { contract: "Data" }, no: { contract: "Data" } },
+            config: { field: "status", routes: { yes: "yes", no: "no" }, default: "no" },
+          },
+          join: {
+            kind: "join",
+            inputs: { votes: { contract: "Data" } },
+            outputs: { passed: { contract: "Data" }, failed: { contract: "Data" } },
+            config: { mode: "n_of_m", field: "vote", threshold: 2 },
+          },
+          each: {
+            kind: "foreach",
+            inputs: { items: { contract: "Data" }, result: { contract: "Data" } },
+            outputs: { next: { contract: "Data" }, done: { contract: "Data" } },
+            config: { input: "items", item_port: "next", result_port: "result", done_port: "done", max_items: 100 },
+          },
+          bounded: {
+            kind: "while",
+            inputs: { state: { contract: "Data" } },
+            outputs: { again: { contract: "Data" }, done: { contract: "Data" } },
+            config: {
+              field: "complete",
+              operator: "truthy",
+              continue_port: "again",
+              done_port: "done",
+              max_iterations: 3,
+            },
+          },
+          suspend: {
+            kind: "await_command",
+            inputs: { summary: { contract: "Data" } },
+            config: { primitive_version: 1, target_actors: ["worker"], command_port: "command" },
+          },
+          terminal: {
+            kind: "terminal",
+            outcome: "success",
+            inputs: { result: { contract: "Data" } },
+          },
+        },
+        edges: [],
+      },
+    };
+
+    expect(Value.Check(WorkflowSpecV1Schema, document)).toBe(true);
+    for (const [nodeId, node] of Object.entries(document.spec.nodes)) {
+      const invalid = structuredClone(document) as any;
+      invalid.spec.nodes[nodeId] = { ...node, unsupported_field: true };
+      expect(Value.Check(WorkflowSpecV1Schema, invalid), nodeId).toBe(false);
+    }
+  });
+
+  it("compiles equivalent YAML and JSON to byte-identical canonical IR", () => {
+    const yaml = compileWorkflowSource(YAML.stringify(MINIMAL_WORKFLOW));
+    const json = compileWorkflowSource(JSON.stringify(MINIMAL_WORKFLOW, null, 2));
+
+    expect(yaml.valid, yaml.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(json.valid, json.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(yaml.canonical_json).toBe(json.canonical_json);
+    expect(yaml.canonical_hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(yaml.canonical_hash).toBe(json.canonical_hash);
+    expect(yaml.summary).toEqual({
+      workflow_id: "bounded-review",
+      node_count: 2,
+      edge_count: 2,
+      entry_nodes: ["execute"],
+      terminal_nodes: ["done"],
+    });
+  });
+
+  it("normalizes handoff and compressed workspace artifact declarations into canonical IR", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.artifacts = [
+      {
+        name: "evidence.tar.gz",
+        source: { type: "workspace", path: "evidence", produced_by: "execute" },
+        archive: { format: "tar.gz" },
+        publish: "always",
+      },
+      {
+        name: "result.json",
+        source: { type: "handoff", node: "execute", port: "result" },
+        media_type: "application/json",
+        contract: "Result",
+        required: true,
+      },
+    ];
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid, result.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(result.canonical?.compiler_version).toBe("6");
+    expect(result.canonical?.artifacts).toEqual([
+      {
+        name: "evidence.tar.gz",
+        source: { type: "workspace", path: "evidence", produced_by: "execute" },
+        media_type: "application/gzip",
+        archive: { format: "tar.gz", deterministic: true },
+        required: false,
+        publish: "always",
+        limits: {
+          max_files: 10_000,
+          max_uncompressed_bytes: 268_435_456,
+          max_compressed_bytes: 134_217_728,
+          timeout_ms: 120_000,
+        },
+      },
+      {
+        name: "result.json",
+        source: { type: "handoff", node: "execute", port: "result" },
+        media_type: "application/json",
+        contract: "Result",
+        required: true,
+        publish: "success",
+      },
+    ]);
+  });
+
+  it("preserves a bounded handoff JSON pointer for nested text artifacts", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.artifacts = [{
+      name: "summary.md",
+      source: {
+        type: "handoff",
+        node: "execute",
+        port: "result",
+        json_pointer: "/details/summary",
+      },
+      media_type: "text/markdown",
+      required: true,
+      publish: "always",
+    }];
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid, result.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(result.canonical?.artifacts).toEqual([{
+      name: "summary.md",
+      source: {
+        type: "handoff",
+        node: "execute",
+        port: "result",
+        json_pointer: "/details/summary",
+      },
+      media_type: "text/markdown",
+      required: true,
+      publish: "always",
+    }]);
+  });
+
+  it("rejects unsafe, duplicate, and contract-invalid artifact declarations", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.artifacts = [
+      {
+        name: "result.json",
+        source: { type: "handoff", node: "execute", port: "result" },
+        media_type: "application/json",
+      },
+      {
+        name: "result.json",
+        source: { type: "workspace", path: "../evidence", produced_by: "missing" },
+        archive: { format: "tar.gz" },
+      },
+    ];
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid).toBe(false);
+    expect(result.diagnostics.map((item) => item.code)).toEqual(expect.arrayContaining([
+      "DAG_SEMANTIC_ARTIFACT_CONTRACT_REQUIRED",
+      "DAG_SEMANTIC_DUPLICATE_ARTIFACT",
+      "DAG_SEMANTIC_UNSAFE_ARTIFACT_PATH",
+      "DAG_SEMANTIC_UNKNOWN_NODE",
+    ]));
+  });
+
+  it("rejects unknown and provider-specific fields with source positions", () => {
+    const source = YAML.stringify({
+      ...MINIMAL_WORKFLOW,
+      spec: {
+        ...MINIMAL_WORKFLOW.spec,
+        agents: {
+          worker: {
+            ...MINIMAL_WORKFLOW.spec.agents.worker,
+            model: "provider-owned-model",
+          },
+        },
+      },
+    });
+    const result = compileWorkflowSource(source);
+
+    expect(result.valid).toBe(false);
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        severity: "error",
+        code: "DAG_SCHEMA_UNKNOWN_FIELD",
+        path: "/spec/agents/worker/model",
+        line: expect.any(Number),
+        column: expect.any(Number),
+      }),
+    ]));
+  });
+
+  it("reports port contract mismatches before runtime", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.nodes.done.inputs.result.contract = "Task";
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid).toBe(false);
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "DAG_SEMANTIC_CONTRACT_MISMATCH", path: "/spec/edges/1" }),
+    ]));
+  });
+
+  it("rejects an unknown dynamic fan-out result contract", () => {
+    const result = compileWorkflowSource(`
+api_version: atms.ai/v1
+kind: Workflow
+metadata: { id: fanout-contract, name: Fanout Contract }
+spec:
+  contracts: { Items: { type: array } }
+  agents: { worker: { system: Work. } }
+  nodes:
+    fan:
+      kind: fanout
+      inputs: { items: { contract: Items } }
+      outputs: { passed: {}, failed: {} }
+      config:
+        input: items
+        worker_agent: worker
+        max_items: 2
+        max_parallelism: 1
+        completion: all
+        result_contract: MissingResult
+        result_port: passed
+        failed_port: failed
+    done: { kind: terminal, outcome: success, inputs: { result: {} } }
+    failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+  edges:
+    - { from: $run.input, to: fan.items }
+    - { from: fan.passed, to: done.result }
+    - { from: fan.failed, to: failed.result, condition: on_failure }
+`);
+
+    expect(result.valid).toBe(false);
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: "DAG_SEMANTIC_UNKNOWN_CONTRACT",
+        path: "/spec/nodes/fan/config/result_contract",
+      }),
+    ]));
+  });
+
+  it("requires a dynamic fan-out result contract when evidence is required", () => {
+    const result = compileWorkflowSource(`
+api_version: atms.ai/v1
+kind: Workflow
+metadata: { id: fanout-evidence-contract, name: Fanout Evidence Contract }
+spec:
+  contracts:
+    Items: { type: array }
+    Report: { type: object }
+  agents: { worker: { system: Work. } }
+  nodes:
+    fan:
+      kind: fanout
+      inputs: { items: { contract: Items } }
+      outputs: { passed: {}, failed: {} }
+      config:
+        input: items
+        worker_agent: worker
+        worker_policy:
+          workspace_access: { writable_paths: [work], readonly_paths: [input] }
+          allowed_dag_tools: [handoff]
+        max_items: 2
+        max_parallelism: 1
+        completion: all
+        result_required_workspace_files:
+          - { path_field: report.path, sha256_field: report.sha256, contract: Report }
+        result_port: passed
+        failed_port: failed
+    done: { kind: terminal, outcome: success, inputs: { result: {} } }
+    failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+  edges:
+    - { from: $run.input, to: fan.items }
+    - { from: fan.passed, to: done.result }
+    - { from: fan.failed, to: failed.result, condition: on_failure }
+`);
+
+    expect(result.valid).toBe(false);
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: "DAG_SEMANTIC_FANOUT_RESULT_CONTRACT_REQUIRED",
+        path: "/spec/nodes/fan/config/result_contract",
+      }),
+    ]));
+  });
+
+  it("requires isolated fanout workers to declare their injected writable worktree", () => {
+    const source = `
+api_version: atms.ai/v1
+kind: Workflow
+metadata: { id: isolated-fanout, name: Isolated Fanout }
+spec:
+  contracts: { Items: { type: array } }
+  agents: { worker: { system: Work. } }
+  nodes:
+    fan:
+      kind: fanout
+      inputs: { items: { contract: Items } }
+      outputs: { passed: {}, failed: {} }
+      config:
+        input: items
+        worker_agent: worker
+        worker_policy:
+          allowed_dag_tools: [handoff]
+          workspace_access: { writable_paths: [], readonly_paths: [input] }
+        workspace_strategy: isolated_git_worktree
+        repository_path: repo
+        result_git_commit:
+          commit_field: commit_sha
+          workspace_field: workspace_path
+          require_clean: true
+        max_items: 2
+        max_parallelism: 1
+        completion: all
+        result_port: passed
+        failed_port: failed
+    done: { kind: terminal, outcome: success, inputs: { result: {} } }
+    failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+  edges:
+    - { from: $run.input, to: fan.items }
+    - { from: fan.passed, to: done.result }
+    - { from: fan.failed, to: failed.result, condition: on_failure }
+`;
+    const missing = compileWorkflowSource(source);
+    expect(missing.valid).toBe(false);
+    expect(missing.diagnostics).toContainEqual(expect.objectContaining({
+      code: "DAG_SEMANTIC_FANOUT_WORKSPACE_REQUIRED",
+      path: "/spec/nodes/fan/config/worker_policy/workspace_access/writable_paths",
+    }));
+
+    const declared = compileWorkflowSource(source.replace(
+      "writable_paths: []",
+      "writable_paths: ['{{fanout_workspace}}']",
+    ));
+    expect(declared.valid, declared.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+
+    const shared = compileWorkflowSource(source
+      .replace("writable_paths: []", "writable_paths: ['{{fanout_workspace}}']")
+      .replace("workspace_strategy: isolated_git_worktree", "workspace_strategy: shared"));
+    expect(shared.valid).toBe(false);
+    expect(shared.diagnostics).toContainEqual(expect.objectContaining({
+      code: "DAG_SEMANTIC_FANOUT_GIT_RESULT_REQUIRES_WORKTREE",
+      path: "/spec/nodes/fan/config/result_git_commit",
+    }));
+  });
+
+  it("rejects an approval workflow that authorizes its proposer", () => {
+    const result = compileWorkflowSource(`
+api_version: atms.ai/v1
+kind: Workflow
+metadata: { id: self-approval, name: Self Approval }
+spec:
+  agents: {}
+  nodes:
+    approve:
+      kind: approval
+      outputs: { approved: {}, rejected: {} }
+      config:
+        approval_id: release
+        proposer_actor: agent:proposer
+        authorized_actors: [agent:proposer]
+        approved_port: approved
+        rejected_port: rejected
+    done: { kind: terminal, outcome: success, inputs: { result: {} } }
+    rejected: { kind: terminal, outcome: failure, inputs: { result: {} } }
+  edges:
+    - { from: approve.approved, to: done.result }
+    - { from: approve.rejected, to: rejected.result, condition: on_failure }
+`);
+
+    expect(result.valid).toBe(false);
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: "DAG_SEMANTIC_SELF_APPROVAL",
+        path: "/spec/nodes/approve/config/authorized_actors",
+      }),
+    ]));
+  });
+
+  it("compiles await_command as an outputless persistent runtime gateway", () => {
+    const result = compileWorkflowSource(YAML.stringify(awaitCommandWorkflow()));
+
+    expect(result.valid, result.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(result.diagnostics.map((item) => item.code)).not.toContain("DAG_SEMANTIC_NO_TERMINAL_PATH");
+    expect(result.canonical?.compiler_version).toBe("6");
+    expect(result.canonical?.feedback_edges).toEqual([]);
+    expect(result.canonical?.nodes.find((node) => node.id === "suspend")).toMatchObject({
+      kind: "await_command",
+      outputs: [],
+      config: {
+        primitive_version: 1,
+        target_actors: ["actor"],
+        expires_after_ms: 60_000,
+        command_port: "next_command",
+      },
+    });
+
+    const runtime = projectCanonicalWorkflowToParsedDAG(result.canonical!);
+    expect(runtime.graph.nodes.find((node) => node.node_id === "suspend")).toMatchObject({
+      node_type: "await_command_gateway",
+      agent: "__gateway__",
+      outputs: {},
+      gateway_config: {
+        type: "await_command",
+        primitive_version: 1,
+        target_actors: ["actor"],
+        expires_after_ms: 60_000,
+        command_port: "next_command",
+      },
+    });
+  });
+
+  it("accepts await_command as the persistent workflow boundary", () => {
+    const workflow = awaitCommandWorkflow();
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid, result.diagnostics.map((entry) => entry.message).join("\n")).toBe(true);
+    expect(result.diagnostics.map((entry) => entry.code)).not.toContain("DAG_SEMANTIC_TERMINAL_REQUIRED");
+  });
+
+  it("rejects strict downstream dependencies from await_command", () => {
+    const workflow = awaitCommandWorkflow();
+    workflow.spec.nodes.after_suspend = {
+      kind: "terminal",
+      outcome: "success",
+      depends_on: ["suspend"],
+    };
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid).toBe(false);
+    expect(result.diagnostics).toContainEqual(expect.objectContaining({
+      code: "DAG_SEMANTIC_AWAIT_COMMAND_DOWNSTREAM",
+      path: "/spec/nodes/after_suspend/depends_on",
+      message: expect.stringMatching(/await_command .* cannot have downstream dependents/i),
+    }));
+  });
+
+  it.each([0, 2, 1.5, "1"])("rejects await_command primitive_version %j", (primitiveVersion) => {
+    const workflow = awaitCommandWorkflow();
+    workflow.spec.nodes.suspend.config.primitive_version = primitiveVersion;
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid).toBe(false);
+    expect(result.diagnostics).toContainEqual(expect.objectContaining({
+      code: "DAG_SCHEMA_INVALID_FIELD",
+      path: "/spec/nodes/suspend",
+    }));
+  });
+
+  it.each([
+    ["itself", "suspend", "DAG_SEMANTIC_INVALID_TARGET_ACTOR"],
+    ["another gateway", "other_suspend", "DAG_SEMANTIC_INVALID_TARGET_ACTOR"],
+    ["an unknown node", "missing_actor", "DAG_SEMANTIC_UNKNOWN_NODE"],
+  ])("rejects await_command target_actors that reference %s", (_label, targetActor, code) => {
+    const workflow = awaitCommandWorkflow();
+    workflow.spec.nodes.other_suspend = {
+      kind: "await_command",
+      config: { primitive_version: 1, target_actors: ["actor"] },
+    };
+    workflow.spec.nodes.suspend.config.target_actors = [targetActor];
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid).toBe(false);
+    expect(result.diagnostics).toContainEqual(expect.objectContaining({
+      code,
+      path: "/spec/nodes/suspend/config/target_actors/0",
+    }));
+  });
+
+  it("preserves await_command config through canonical and authoring round trips", () => {
+    const first = compileWorkflowSource(YAML.stringify(awaitCommandWorkflow()));
+    expect(first.valid).toBe(true);
+
+    const authoring = canonicalWorkflowToV1Document(first.canonical!);
+    expect((authoring.spec as any).nodes.suspend).toEqual({
+      kind: "await_command",
+      inputs: { summary: {} },
+      config: {
+        command_port: "next_command",
+        expires_after_ms: 60_000,
+        primitive_version: 1,
+        target_actors: ["actor"],
+      },
+    });
+
+    const second = compileWorkflowSource(YAML.stringify(authoring));
+    expect(second.valid, second.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(second.canonical?.nodes.find((node) => node.id === "suspend")?.config)
+      .toEqual(first.canonical?.nodes.find((node) => node.id === "suspend")?.config);
+  });
+
+  it("requires explicit terminals and rejects normal cycles", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    delete workflow.spec.nodes.done;
+    workflow.spec.nodes.execute.inputs.feedback = { contract: "Result" };
+    workflow.spec.edges[1] = { from: "execute.result", to: "execute.feedback" };
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid).toBe(false);
+    expect(result.diagnostics.map((item) => item.code)).toEqual(expect.arrayContaining([
+      "DAG_SEMANTIC_UNBOUNDED_CYCLE",
+      "DAG_SEMANTIC_TERMINAL_REQUIRED",
+    ]));
+  });
+
+  it("accepts bounded feedback only when it targets a loop node", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.nodes.loop = {
+      kind: "while",
+      inputs: { state: { contract: "Result" } },
+      outputs: {
+        again: { contract: "Result" },
+        complete: { contract: "Result" },
+      },
+      config: {
+        field: "status",
+        operator: "ne",
+        value: "success",
+        continue_port: "again",
+        done_port: "complete",
+        max_iterations: 3,
+      },
+    };
+    workflow.spec.nodes.execute.inputs.feedback = { contract: "Result" };
+    workflow.spec.edges = [
+      { from: "$run.input", to: "execute.task" },
+      { from: "execute.result", to: "loop.state" },
+      { kind: "feedback", from: "loop.again", to: "loop.state", max_traversals: 3 },
+      { from: "loop.complete", to: "done.result" },
+    ];
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid, result.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(result.canonical?.feedback_edges).toHaveLength(1);
+  });
+
+  it("accepts existing unversioned workflows through an isolated legacy adapter", () => {
+    const result = compileWorkflowSource(`
+name: Legacy Review
+workflow_id: legacy-review
+agents:
+  worker:
+    system: Do the work.
+nodes:
+  execute:
+    agent: worker
+    outputs:
+      done:
+        to: ""
+`);
+
+    expect(result.valid, result.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(result.source_api_version).toBe("legacy/v0");
+    expect(result.diagnostics).toEqual([
+      expect.objectContaining({ severity: "warning", code: "DAG_LEGACY_UNVERSIONED_SOURCE" }),
+    ]);
+    expect(result.canonical?.terminal_nodes).toHaveLength(1);
+  });
+
+  it("loads the tracked v1 template through the same path used to create runs", () => {
+    const parsed = parseWorkflowSourceFile(path.resolve(
+      "..",
+      "assets",
+      "orchestrations",
+      "workflow-spec-v1-minimal.yaml.template",
+    ));
+
+    expect(parsed.meta).toMatchObject({
+      workflow_id: "workflow-spec-v1-minimal",
+      source_api_version: "atms.ai/v1",
+    });
+    expect(parsed.graph.nodes.map((node) => node.node_id)).toEqual(["execute"]);
+    expect(parsed.graph.edges).toEqual(expect.arrayContaining([
+      expect.objectContaining({ from_node: "execute", from_port: "result", to_node: "" }),
+    ]));
+  });
+
+  it.each(PUBLIC_V1_ASSETS)("compiles the public v1 asset: %s", (file) => {
+    const source = fs.readFileSync(path.resolve("..", "assets", "orchestrations", file), "utf8");
+    const result = compileWorkflowSource(source);
+
+    expect(result.valid, result.diagnostics.map((item) => `${item.code} ${item.path}: ${item.message}`).join("\n")).toBe(true);
+    expect(result.source_api_version).toBe("atms.ai/v1");
+    expect(result.canonical_hash).toMatch(/^[a-f0-9]{64}$/);
+  });
+});

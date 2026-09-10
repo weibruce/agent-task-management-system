@@ -1,0 +1,4 @@
+interface:
+  display_name: "Atms DAG Patterns"
+  short_description: "Choose and instantiate reusable DAG design patterns."
+  default_prompt: "Use $atms-dag-patterns to select, adapt, and validate a Atms DAG design pattern."

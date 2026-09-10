@@ -1,0 +1,406 @@
+/**
+ * Tests for DAG tools: handoff, send_message, receive_message, get_graph_context.
+ */
+
+import { describe, it, expect, vi, beforeEach, type Mock } from "vitest";
+import {
+  createDagToolsState,
+  createDagTools,
+  deliverInbox,
+} from "../dag-tools/index.js";
+import type { DagNodeConfig } from "atms-protocol";
+
+function makeConfig(overrides: Partial<DagNodeConfig> = {}): DagNodeConfig {
+  return {
+    node_id: "coder",
+    agent_type: "claude-sdk",
+    model: "test",
+    outgoing_edges: [
+      { from_port: "done", to_node: "tester", to_port: "in" },
+    ],
+    incoming_edges: [
+      { from_node: "triage", from_port: "done", to_port: "in" },
+    ],
+    graph_nodes: ["triage", "coder", "tester"],
+    ...overrides,
+  };
+}
+
+describe("DAG tools", () => {
+  let wsSend: Mock<(data: string) => void>;
+  let state: ReturnType<typeof createDagToolsState>;
+
+  beforeEach(() => {
+    wsSend = vi.fn();
+    state = createDagToolsState(makeConfig(), "run-1", wsSend);
+  });
+
+  describe("get_graph_context", () => {
+    it("returns correct graph context", async () => {
+      const tools = createDagTools(state);
+      const ctxTool = tools.find((t) => t.name === "get_graph_context")!;
+      const result = await ctxTool.handler({});
+
+      expect(result.content).toHaveLength(1);
+      const ctx = JSON.parse((result.content as any)[0].text);
+      expect(ctx.run_id).toBe("run-1");
+      expect(ctx.node_id).toBe("coder");
+      expect(ctx.available_ports).toEqual(["done"]);
+      expect(ctx.graph_nodes).toEqual(["triage", "coder", "tester"]);
+      expect(ctx.predecessors).toEqual([
+        { node: "triage", from_port: "done", to_port: "in" },
+      ]);
+      expect(ctx.successors).toEqual([
+        { node: "tester", from_port: "done", to_port: "in" },
+      ]);
+    });
+  });
+
+  describe("handoff", () => {
+    it("stages an authoritative handoff on a valid port", async () => {
+      const tools = createDagTools(state);
+      const handoffTool = tools.find((t) => t.name === "handoff")!;
+
+      const result = await handoffTool.handler({
+        port: "done",
+        content: "test content",
+        summary: "done",
+      });
+
+      expect(result.is_error).toBeFalsy();
+      expect(wsSend).not.toHaveBeenCalled();
+      expect(state.handoffData).toMatchObject({
+        type: "node_handoff",
+        runId: "run-1",
+        nodeId: "coder",
+        port: "done",
+        from_node: "coder",
+        from_port: "done",
+        session_id: "run-1",
+        content: "test content",
+      });
+      expect(state.handoffData).not.toHaveProperty("round_id");
+      expect(state.yielded).toBe(true);
+      expect(state.toolArgumentParseState).toBe("valid");
+      expect(state.contractStage).toBe("tool_arguments");
+    });
+
+    it("stages the dispatch transport fence in the authoritative handoff", async () => {
+      state = createDagToolsState(makeConfig({
+        round_id: "round-0002",
+        actor_id: "actor-coder",
+        generation: 2,
+        command_id: "command-2",
+      }), "run-1", wsSend);
+      const handoffTool = createDagTools(state).find((tool) => tool.name === "handoff")!;
+
+      await handoffTool.handler({ port: "done", content: { ok: true } });
+
+      expect(state.handoffData).toMatchObject({
+        round_id: "round-0002",
+        actor_id: "actor-coder",
+        generation: 2,
+        command_id: "command-2",
+      });
+    });
+
+    it("uses the DAG node session id on handoff when provided", async () => {
+      state = createDagToolsState(makeConfig({ session_id: "node-session-2" }), "run-1", wsSend);
+      const tools = createDagTools(state);
+      const handoffTool = tools.find((t) => t.name === "handoff")!;
+
+      await handoffTool.handler({
+        port: "done",
+        content: "test content",
+      });
+
+      expect(state.handoffData).toMatchObject({ session_id: "node-session-2" });
+    });
+
+    it("normalizes a complete JSON object string before contract validation", async () => {
+      const tools = createDagTools(state);
+      const handoffTool = tools.find((t) => t.name === "handoff")!;
+
+      await handoffTool.handler({
+        port: "done",
+        content: '{"work_items":[{"id":"one"}]}',
+      });
+
+      expect(state.handoffData).toMatchObject({ content: { work_items: [{ id: "one" }] } });
+    });
+
+    it("preserves ordinary and malformed JSON-like text", async () => {
+      const tools = createDagTools(state);
+      const handoffTool = tools.find((t) => t.name === "handoff")!;
+
+      await handoffTool.handler({ port: "done", content: "{not-json}" });
+
+      expect(state.handoffData).toMatchObject({ content: "{not-json}" });
+    });
+
+    it("rejects invalid port", async () => {
+      const tools = createDagTools(state);
+      const handoffTool = tools.find((t) => t.name === "handoff")!;
+
+      expect(handoffTool.input_schema).toMatchObject({
+        additionalProperties: false,
+        properties: { port: { enum: ["done"] } },
+      });
+
+      const result = await handoffTool.handler({
+        port: "invalid",
+        content: "x",
+      });
+
+      expect(result.is_error).toBe(true);
+      expect(wsSend).not.toHaveBeenCalled();
+      expect(state.toolArgumentParseState).toBe("invalid");
+      expect(state.yielded).toBe(false);
+    });
+
+    it("projects a shared exact output contract and rejects a top-level-only summary", async () => {
+      const voteSchema = {
+        type: "object",
+        additionalProperties: false,
+        required: ["reviewer", "summary"],
+        properties: {
+          reviewer: { type: "string", const: "qwen" },
+          summary: { type: "string", minLength: 1 },
+        },
+      };
+      const contracted = createDagToolsState(makeConfig({
+        outgoing_edges: [
+          { from_port: "voted", to_node: "normalize", to_port: "vote" },
+          { from_port: "failed", to_node: "normalize", to_port: "vote" },
+        ],
+        output_contracts: {
+          voted: { contract: "VerificationVote", schema: voteSchema },
+          failed: { contract: "VerificationVote", schema: structuredClone(voteSchema) },
+        },
+      }), "run-contracted", wsSend);
+      const handoffTool = createDagTools(contracted).find((tool) => tool.name === "handoff")!;
+
+      expect((handoffTool.input_schema.properties as Record<string, unknown>).content)
+        .toEqual(voteSchema);
+
+      const rejected = await handoffTool.handler({
+        port: "voted",
+        content: { reviewer: "qwen" },
+        summary: "This does not satisfy content.summary",
+      });
+      expect(rejected).toMatchObject({ is_error: true });
+      expect(contracted.yielded).toBe(false);
+      expect(contracted.contractStage).toBe("contract_validation");
+      expect(contracted.toolArgumentParseError).toContain("summary");
+
+      const accepted = await handoffTool.handler({
+        port: "voted",
+        content: { reviewer: "qwen", summary: "Contract summary" },
+      });
+      expect(accepted.is_error).toBeFalsy();
+      expect(contracted.yielded).toBe(true);
+    });
+
+    it("keeps generic handoff content when output ports have different contracts", () => {
+      const contracted = createDagToolsState(makeConfig({
+        outgoing_edges: [
+          { from_port: "done", to_node: "terminal", to_port: "result" },
+          { from_port: "failed", to_node: "failed", to_port: "error" },
+        ],
+        output_contracts: {
+          done: { contract: "Result", schema: { type: "object", required: ["result"] } },
+          failed: { contract: "Failure", schema: { type: "object", required: ["error"] } },
+        },
+      }), "run-mixed-contracts", wsSend);
+      const handoffTool = createDagTools(contracted).find((tool) => tool.name === "handoff")!;
+      const content = (handoffTool.input_schema.properties as Record<string, Record<string, unknown>>).content;
+
+      expect(content.type).toBeUndefined();
+      expect(content.description).toContain("完整交接内容");
+    });
+
+    it("records missing and invalid tool-argument parse states without yielding", async () => {
+      const tools = createDagTools(state);
+      const handoffTool = tools.find((t) => t.name === "handoff")!;
+
+      const missing = await handoffTool.handler({ port: "done" });
+      expect(missing.is_error).toBe(true);
+      expect(state.toolArgumentParseState).toBe("missing");
+      expect(state.yielded).toBe(false);
+
+      const invalid = await handoffTool.handler({
+        port: "done",
+        content: "x",
+        unexpected: true,
+      });
+      expect(invalid.is_error).toBe(true);
+      expect(state.toolArgumentParseState).toBe("invalid");
+      expect(state.toolArgumentParseError).toContain("unexpected");
+      expect(state.yielded).toBe(false);
+    });
+
+    it("rejects contract fields outside content without consuming the handoff", async () => {
+      const tools = createDagTools(state);
+      const handoffTool = tools.find((t) => t.name === "handoff")!;
+
+      const invalid = await handoffTool.handler({
+        port: "done",
+        content: { markdown: "report" },
+        run_id: "run-1",
+      });
+      expect(invalid).toMatchObject({ is_error: true });
+      expect(state.yielded).toBe(false);
+      expect(state.handoffData).toBeNull();
+
+      const corrected = await handoffTool.handler({
+        port: "done",
+        content: { markdown: "report", run_id: "run-1" },
+      });
+      expect(corrected.is_error).not.toBe(true);
+      expect(state.handoffData).toMatchObject({
+        content: { markdown: "report", run_id: "run-1" },
+      });
+    });
+
+    it("rejects duplicate handoff", async () => {
+      const tools = createDagTools(state);
+      const handoffTool = tools.find((t) => t.name === "handoff")!;
+
+      await handoffTool.handler({ port: "done", content: "first" });
+      const result = await handoffTool.handler({ port: "done", content: "second" });
+
+      expect(result.is_error).toBe(true);
+    });
+  });
+
+  describe("manager_command", () => {
+    it("rejects legacy manager command requests", async () => {
+      const tools = createDagTools(state);
+      const managerTool = tools.find((t) => t.name === "manager_command")!;
+
+      const result = await managerTool.handler({
+        command: "append_node",
+        command_id: "cmd-1",
+        append: { node_id: "observer", after: ["coder"] },
+      });
+
+      expect(result.is_error).toBe(true);
+      expect(wsSend).not.toHaveBeenCalled();
+      expect(result.content[0]?.text).toContain("unsupported");
+    });
+  });
+
+  describe("send_message", () => {
+    it("sends to valid node", async () => {
+      const tools = createDagTools(state);
+      const sendTool = tools.find((t) => t.name === "send_message")!;
+
+      const result = await sendTool.handler({
+        to_node: "tester",
+        content: "hello",
+      });
+
+      expect(result.is_error).toBeFalsy();
+      const sent = JSON.parse(wsSend.mock.calls[0][0]);
+      expect(sent.data.type).toBe("node_send_message");
+      expect(sent.data.run_id).toBe("run-1");
+      expect(sent.data.from_node).toBe("coder");
+      expect(sent.data.to_node).toBe("tester");
+      expect(sent.session_id).toBe("run-1");
+      expect(sent.data.session_id).toBe("run-1");
+    });
+
+    it("uses the DAG node session id on send_message when provided", async () => {
+      state = createDagToolsState(makeConfig({ session_id: "node-session-send" }), "run-1", wsSend);
+      const tools = createDagTools(state);
+      const sendTool = tools.find((t) => t.name === "send_message")!;
+
+      await sendTool.handler({
+        to_node: "tester",
+        content: "hello",
+      });
+
+      const sent = JSON.parse(wsSend.mock.calls[0][0]);
+      expect(sent.session_id).toBe("node-session-send");
+      expect(sent.data.session_id).toBe("node-session-send");
+    });
+
+    it("rejects invalid node", async () => {
+      const tools = createDagTools(state);
+      const sendTool = tools.find((t) => t.name === "send_message")!;
+
+      const result = await sendTool.handler({
+        to_node: "nonexistent",
+        content: "x",
+      });
+
+      expect(result.is_error).toBe(true);
+    });
+  });
+
+  describe("receive_message", () => {
+    it("returns immediately if inbox has message", async () => {
+      const tools = createDagTools(state);
+      const recvTool = tools.find((t) => t.name === "receive_message")!;
+
+      deliverInbox(state, "test message");
+      const result = await recvTool.handler({});
+
+      expect(result.is_error).toBeFalsy();
+      const text = (result.content as any)[0].text;
+      expect(JSON.parse(text).content).toBe("test message");
+    });
+
+    it("wakes on deliverInbox", async () => {
+      const tools = createDagTools(state);
+      const recvTool = tools.find((t) => t.name === "receive_message")!;
+
+      // Start receive (will block)
+      const promise = recvTool.handler({ timeout: 5 });
+      const sent = JSON.parse(wsSend.mock.calls[0][0]);
+      expect(sent.type).toBe("response");
+      expect(sent.session_id).toBe("run-1");
+      expect(sent.data.session_id).toBe("run-1");
+
+      // Deliver after a tick
+      setTimeout(() => deliverInbox(state, "delayed msg"), 10);
+
+      const result = await promise;
+      const text = (result.content as any)[0].text;
+      expect(JSON.parse(text).content).toBe("delayed msg");
+    });
+
+    it("preserves routed node messages from manager", async () => {
+      const tools = createDagTools(state);
+      const recvTool = tools.find((t) => t.name === "receive_message")!;
+
+      deliverInbox(state, {
+        type: "node_message",
+        runId: "run-1",
+        fromNode: "triage",
+        toNode: "coder",
+        content: { question: "ready?" },
+        timestamp: 123,
+      });
+
+      const result = await recvTool.handler({});
+      const text = (result.content as any)[0].text;
+      expect(JSON.parse(text)).toMatchObject({
+        type: "node_message",
+        runId: "run-1",
+        fromNode: "triage",
+        toNode: "coder",
+        content: { question: "ready?" },
+      });
+    });
+
+    it("times out when no message", async () => {
+      const tools = createDagTools(state);
+      const recvTool = tools.find((t) => t.name === "receive_message")!;
+
+      const result = await recvTool.handler({ timeout: 1 });
+      const text = (result.content as any)[0].text;
+      expect(text).toContain("超时");
+    });
+  });
+});

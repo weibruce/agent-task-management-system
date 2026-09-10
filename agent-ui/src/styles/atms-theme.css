@@ -1,0 +1,193 @@
+/* ==========================================================================
+   Atms appearance token contract
+
+   Built-in and external appearances are registered in
+   appearance/appearance-registry.ts. An appearance owns only this semantic
+   token surface; components must never branch on an appearance id.
+   ========================================================================== */
+
+:root,
+:root[data-atms-appearance='cockpit'],
+:root[data-atms-theme='cockpit'] {
+  color-scheme: dark;
+
+  --atms-bg: #06080d;
+  --atms-bg-raised: #0a0f18;
+  --atms-surface-1: rgba(148, 178, 214, 0.055);
+  --atms-surface-2: rgba(148, 178, 214, 0.095);
+  --atms-surface-3: rgba(148, 178, 214, 0.15);
+  --atms-panel: rgba(10, 15, 23, 0.92);
+  --atms-control: rgba(148, 178, 214, 0.075);
+  --atms-control-hover: rgba(148, 178, 214, 0.12);
+  --atms-control-active: rgba(148, 178, 214, 0.18);
+  --atms-overlay: rgba(2, 5, 10, 0.76);
+  --atms-code-bg: rgba(3, 6, 11, 0.72);
+
+  --atms-border: rgba(148, 178, 214, 0.1);
+  --atms-border-strong: rgba(148, 178, 214, 0.2);
+
+  --atms-text-1: rgba(237, 244, 252, 0.96);
+  --atms-text-2: rgba(222, 233, 246, 0.72);
+  --atms-text-3: rgba(213, 226, 241, 0.56);
+  --atms-text-4: rgba(206, 221, 238, 0.38);
+  --atms-on-strong: #ffffff;
+
+  --atms-accent: #4fd8e8;
+  --atms-accent-hover: #7de5ef;
+  --atms-accent-soft: rgba(79, 216, 232, 0.12);
+  --atms-accent-border: rgba(79, 216, 232, 0.3);
+  --atms-on-accent: #04222a;
+
+  --atms-speaking: #a5b4fc;
+  --atms-speaking-soft: rgba(129, 140, 248, 0.12);
+  --atms-speaking-border: rgba(129, 140, 248, 0.32);
+  --atms-success: #5ee2ad;
+  --atms-success-soft: rgba(52, 211, 153, 0.12);
+  --atms-success-border: rgba(52, 211, 153, 0.32);
+  --atms-warning: #fbc94b;
+  --atms-warning-soft: rgba(251, 191, 36, 0.12);
+  --atms-warning-border: rgba(251, 191, 36, 0.34);
+  --atms-danger: #fca5a5;
+  --atms-danger-soft: rgba(248, 113, 113, 0.12);
+  --atms-danger-border: rgba(248, 113, 113, 0.34);
+  --atms-info: #93c5fd;
+  --atms-info-soft: rgba(124, 179, 255, 0.12);
+  --atms-info-border: rgba(124, 179, 255, 0.3);
+
+  --atms-focus-ring: rgba(79, 216, 232, 0.32);
+  --atms-selection: rgba(79, 216, 232, 0.24);
+  --atms-scrollbar-track: #0a0f18;
+  --atms-scrollbar: #2a3541;
+  --atms-scrollbar-hover: #435565;
+  --atms-ambient-accent: color-mix(in srgb, var(--atms-accent) 18%, transparent);
+  --atms-ambient-info: color-mix(in srgb, var(--atms-accent) 12%, transparent);
+  --atms-canvas-ambient-primary: color-mix(in srgb, var(--atms-accent) 12%, transparent);
+  --atms-canvas-ambient-secondary: color-mix(in srgb, var(--atms-success) 8%, transparent);
+  --atms-decorative-accent-soft: var(--atms-accent-soft);
+  --atms-decorative-accent-border: var(--atms-accent-border);
+  --atms-decorative-speaking-soft: var(--atms-speaking-soft);
+  --atms-decorative-speaking-border: var(--atms-speaking-border);
+  --atms-settings-sidebar: var(--atms-surface-1);
+  --atms-settings-card: var(--atms-surface-1);
+  --atms-settings-card-hover: var(--atms-surface-2);
+  --atms-settings-divider: var(--atms-border);
+  --atms-settings-active: var(--atms-accent-soft);
+  --atms-settings-active-border: var(--atms-accent-border);
+
+  --atms-radius-lg: 16px;
+  --atms-radius-md: 12px;
+  --atms-radius-sm: 9px;
+
+  --atms-shadow-panel: 0 24px 70px rgba(0, 0, 0, 0.32);
+  --atms-shadow-floating: 0 28px 90px rgba(0, 0, 0, 0.56);
+  --atms-shadow-accent: 0 0 28px color-mix(in srgb, var(--atms-accent) 16%, transparent);
+}
+
+:root[data-atms-appearance='paper'],
+:root[data-atms-theme='paper'] {
+  color-scheme: light;
+
+  --atms-bg: #e9edef;
+  --atms-bg-raised: #eef1f2;
+  --atms-surface-1: #f4f5f5;
+  --atms-surface-2: #eaedef;
+  --atms-surface-3: #dde3e6;
+  --atms-panel: #f7f8f7;
+  --atms-control: #eceff0;
+  --atms-control-hover: #e3e8ea;
+  --atms-control-active: #dbe2e5;
+  --atms-overlay: rgba(38, 50, 58, 0.28);
+  --atms-code-bg: #e5e9eb;
+
+  --atms-border: #cbd3d8;
+  --atms-border-strong: #aebbc3;
+
+  --atms-text-1: #26323a;
+  --atms-text-2: #46545e;
+  --atms-text-3: #65737d;
+  --atms-text-4: #89949c;
+  --atms-on-strong: #f7fbfb;
+
+  --atms-accent: #2e727a;
+  --atms-accent-hover: #245f66;
+  --atms-accent-soft: #dbe9ea;
+  --atms-accent-border: #a9c9cd;
+  --atms-on-accent: #f7fbfb;
+
+  --atms-speaking: #656b9d;
+  --atms-speaking-soft: #e3e4ee;
+  --atms-speaking-border: #c1c3d6;
+  --atms-success: #3e755f;
+  --atms-success-soft: #deebe5;
+  --atms-success-border: #acd0c1;
+  --atms-warning: #876825;
+  --atms-warning-soft: #f0e8d5;
+  --atms-warning-border: #dac897;
+  --atms-danger: #a15258;
+  --atms-danger-soft: #f0e0e1;
+  --atms-danger-border: #dcb7ba;
+  --atms-info: #456f98;
+  --atms-info-soft: #e0e8ef;
+  --atms-info-border: #b6cadc;
+
+  --atms-focus-ring: rgba(46, 114, 122, 0.25);
+  --atms-selection: rgba(46, 114, 122, 0.18);
+  --atms-scrollbar-track: #eef1f2;
+  --atms-scrollbar: #c0c8cb;
+  --atms-scrollbar-hover: #8e9ca1;
+  --atms-ambient-accent: rgba(46, 114, 122, 0.028);
+  --atms-ambient-info: rgba(69, 111, 152, 0.02);
+  --atms-canvas-ambient-primary: rgba(46, 114, 122, 0.02);
+  --atms-canvas-ambient-secondary: rgba(62, 117, 95, 0.014);
+  --atms-decorative-accent-soft: #eef3f3;
+  --atms-decorative-accent-border: var(--atms-border);
+  --atms-decorative-speaking-soft: #f0f0f4;
+  --atms-decorative-speaking-border: var(--atms-border);
+  --atms-settings-sidebar: #e4e9eb;
+  --atms-settings-card: #f1f3f3;
+  --atms-settings-card-hover: #e7ebed;
+  --atms-settings-divider: #bcc7cd;
+  --atms-settings-active: #d7e6e8;
+  --atms-settings-active-border: #8db7bc;
+
+  --atms-radius-lg: 14px;
+  --atms-radius-md: 10px;
+  --atms-radius-sm: 8px;
+
+  --atms-shadow-panel: 0 1px 2px rgba(37, 50, 58, 0.04), 0 12px 34px rgba(37, 50, 58, 0.07);
+  --atms-shadow-floating: 0 20px 54px rgba(37, 50, 58, 0.14), 0 2px 8px rgba(37, 50, 58, 0.06);
+  --atms-shadow-accent: 0 8px 22px rgba(37, 50, 58, 0.08);
+}
+
+::selection {
+  background: var(--atms-selection);
+  color: var(--atms-text-1);
+}
+
+/* Native select popups are painted by the host UI on Windows and some Linux
+   desktops. Carry the active appearance into that separate popup so a dark
+   control never opens onto a white system canvas. */
+select,
+option,
+optgroup {
+  color-scheme: inherit;
+}
+
+select option,
+select optgroup {
+  background-color: var(--atms-bg-raised);
+  color: var(--atms-text-1);
+}
+
+select option:checked {
+  background-color: var(--atms-control-active);
+}
+
+/* Preserve Windows High Contrast instead of overriding its system palette. */
+@media (forced-colors: active) {
+  select option,
+  select optgroup {
+    background-color: Canvas;
+    color: CanvasText;
+  }
+}

@@ -1,0 +1,343 @@
+/** Ports whose handoffs represent a negative branch rather than success. */
+export const FAILURE_PORT_NAMES: ReadonlySet<string> = new Set([
+  "failed",
+  "failure",
+  "rejected",
+  "error",
+  "blocked",
+  "stale",
+]);
+
+export interface DAGAgentConfig {
+  agent_type?: string;
+  llm_setting_id?: string;
+  llm?: {
+    provider?: string;
+    provider_display_name?: string;
+    model?: string;
+    model_display_name?: string;
+    api_key?: string;
+    base_url?: string;
+    protocol?: string;
+    anthropic_auth_mode?: "api_key" | "auth_token";
+    reasoning_effort?: string;
+    reasoning_effort_map?: Record<string, string | null> | false;
+    service_tier?: string | null;
+  };
+  model?: string;
+  system?: string;
+  description?: string;
+  skills?: string[];
+  /** Exact pinned Skill view ids exposed through report_surface_state. */
+  allowed_surface_views?: string[];
+  extra?: Record<string, unknown>;
+}
+
+export type DAGCodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
+
+export interface DAGOutputRoute {
+  to: string | string[];
+  condition?: "on_success" | "on_failure" | "always" | string;
+  retry_policy?: DAGEdgeRetryPolicy;
+}
+
+export interface DAGEdgeRetryPolicy {
+  max_retries?: number;
+}
+
+export interface DAGNodeRequirements {
+  capabilities?: string[];
+}
+
+export interface DAGGatewayConfig {
+  type?: "loop" | "condition" | "join" | "while" | "command" | "broker" | "approval" | "state" | "fanout" | "await_command" | string;
+  kind?: "loop" | "condition" | "join" | "while" | "command" | "broker" | "approval" | "state" | "fanout" | "await_command" | string;
+  mode?: "all" | "any" | "n_of_m" | string;
+  field?: string;
+  routes?: Record<string, string>;
+  cases?: Record<string, string>;
+  default_port?: string;
+  items?: unknown[];
+  input?: string;
+  item_port?: string;
+  result_port?: string;
+  done_port?: string;
+  passed_port?: string;
+  failed_port?: string;
+  continue_port?: string;
+  exhausted_port?: string;
+  threshold?: number;
+  success_values?: unknown[];
+  operator?: "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "truthy" | "falsy" | string;
+  value?: unknown;
+  unwrap_single_join_value?: boolean;
+  max_iterations?: number;
+  max_items?: number;
+  command?: string[];
+  command_field?: string;
+  stdin_field?: string;
+  cwd?: string;
+  timeout_ms?: number;
+  success_exit_codes?: number[];
+  success_port?: string;
+  failure_port?: string;
+  capture_limit?: number;
+  parse_stdout?: "text" | "json" | "number";
+  result_payload?: "envelope" | "value";
+  credential_ref?: string;
+  purpose?: string;
+  broker?: string;
+  action?: string;
+  input_field?: string;
+  input_map?: Record<string, string>;
+  static_input?: Record<string, unknown>;
+  error_port?: string;
+  approval_id?: string;
+  proposal_field?: string;
+  proposer_actor?: string;
+  authorized_actors?: string[];
+  approved_port?: string;
+  rejected_port?: string;
+  primitive_version?: 1;
+  target_actors?: string[];
+  expires_after_ms?: number;
+  command_port?: string;
+  namespace?: string;
+  key?: string;
+  key_field?: string;
+  operation?: "get" | "set" | "increment" | "compare_and_set" | "trust_update" | "budget_admit" | string;
+  value_field?: string;
+  expected_version?: number;
+  conflict_port?: string;
+  pass_field?: string;
+  auto_min_runs?: number;
+  auto_min_rate?: number;
+  watch_min_rate?: number;
+  budget_limit?: number;
+  usage_field?: string;
+  item_field?: string;
+  context_field?: string;
+  worker_agent?: string;
+  worker_policy?: Record<string, unknown>;
+  workspace_strategy?: "shared" | "isolated_git_worktree";
+  workspace_root?: string;
+  repository_path?: string;
+  revision_field?: string;
+  result_git_commit?: {
+    commit_field: string;
+    workspace_field: string;
+    require_clean?: boolean;
+    commit_mode?: "worker" | "manager";
+  };
+  max_parallelism?: number;
+  completion?: "all" | "any" | "n_of_m" | string;
+  result_contract?: string;
+  result_required_broker_actions?: Array<{
+    credential_ref: string;
+    broker: string;
+    action: string;
+    when?: { field: string; equals: unknown };
+    result_binding?: { result_field: string; content_field: string };
+    result_digest_binding?: { result_field: string; content_field: string };
+  }>;
+  result_required_workspace_files?: Array<{
+    path_field: string;
+    sha256_field: string;
+    contract: string;
+    max_bytes?: number;
+    bindings?: Array<{ file_field: string; content_field: string }>;
+  }>;
+  success_field?: string;
+  cancel_remaining?: boolean;
+}
+
+export interface DAGPatternInstanceMeta {
+  id: string;
+  version: string;
+  source?: string;
+  parameters?: Record<string, unknown>;
+}
+
+export type DAGArtifactPublish = "success" | "failure" | "always";
+
+export interface DAGHandoffArtifactDeclaration {
+  name: string;
+  source: {
+    type: "handoff";
+    node: string;
+    port: string;
+    json_pointer?: string;
+  };
+  media_type: "application/json" | "text/markdown" | "text/plain";
+  contract?: string;
+  required: boolean;
+  publish: DAGArtifactPublish;
+}
+
+export interface DAGWorkspaceArtifactDeclaration {
+  name: string;
+  source: {
+    type: "workspace";
+    path: string;
+    produced_by: string;
+  };
+  media_type: "application/gzip";
+  archive: {
+    format: "tar.gz";
+    deterministic: boolean;
+  };
+  required: boolean;
+  publish: DAGArtifactPublish;
+  limits: {
+    max_files: number;
+    max_uncompressed_bytes: number;
+    max_compressed_bytes: number;
+    timeout_ms: number;
+  };
+}
+
+export type DAGArtifactDeclaration =
+  | DAGHandoffArtifactDeclaration
+  | DAGWorkspaceArtifactDeclaration;
+
+export interface DAGNodeConfig {
+  agent?: string;
+  type?: string;
+  node_type?: string;
+  gateway_config?: DAGGatewayConfig;
+  gateway?: DAGGatewayConfig;
+  after?: string[];
+  outputs?: Record<string, DAGOutputRoute>;
+  name?: string;
+  description?: string;
+  image?: string;
+  container_group?: string;
+  requires?: DAGNodeRequirements;
+  max_rounds?: number;
+  extra?: Record<string, unknown>;
+}
+
+export interface DAGEdge {
+  from_node: string;
+  from_port: string;
+  to_node: string;
+  to_port: string;
+  condition: string;
+  label?: string;
+  retry_policy?: DAGEdgeRetryPolicy;
+  terminal_outcome?: "success" | "failure" | "cancelled";
+}
+
+export interface RuntimeProfileAgentMapping {
+  provider?: string;
+  model?: string;
+  agent_type?: string;
+}
+
+export interface RuntimeProfile {
+  description?: string;
+  llm?: { provider?: string; model?: string };
+  agents?: Record<string, RuntimeProfileAgentMapping>;
+}
+
+export interface ProviderPolicyConfig {
+  prohibited_providers?: string[];
+  prohibited_models?: string[];
+  reason?: string;
+}
+
+export interface ScorecardHandoffBlockersConfig {
+  enabled?: boolean;
+  statuses?: string[];
+  fields?: string[];
+  success_statuses?: string[];
+  success_forbidden_terms?: string[];
+}
+
+export interface ScorecardHandoffHeaderConfig {
+  enabled?: boolean;
+  nodes?: string[];
+  source_issue_label?: string;
+  artifact_label?: string;
+}
+
+export interface ScorecardSourceIssueConfig {
+  enabled?: boolean;
+  nodes?: string[];
+  label?: string;
+  include_issue_urls?: boolean;
+}
+
+export interface ScorecardQualityGateConfig {
+  enabled?: boolean;
+  nodes?: string[];
+  required_categories?: string[];
+}
+
+export interface ScorecardPolicyConfig {
+  profile?: string;
+  mode?: "off" | "advisory" | "strict";
+  enforcement?: "off" | "advisory" | "strict";
+  handoff_blockers?: ScorecardHandoffBlockersConfig;
+  handoff_header?: ScorecardHandoffHeaderConfig;
+  source_issue?: ScorecardSourceIssueConfig;
+  quality_gate?: ScorecardQualityGateConfig;
+}
+
+export interface ResolvedWorkflowMeta {
+  name: string;
+  workflow_id?: string;
+  workflow_revision?: number;
+  canonical_hash?: string;
+  compiler_version?: string;
+  source_api_version?: string;
+  contracts?: Record<string, unknown>;
+  artifacts?: DAGArtifactDeclaration[];
+  triggers?: Record<string, {
+    type: "interval" | "event";
+    every_ms?: number;
+    event?: string;
+    overlap: "skip" | "allow";
+    max_concurrency: number;
+    enabled: boolean;
+  }>;
+  run_input_targets?: Array<{ node: string; port: string; contract?: string }>;
+  description?: string;
+  llm?: { provider?: string; model?: string };
+  runtime_profiles?: Record<string, RuntimeProfile>;
+  provider_policy?: ProviderPolicyConfig;
+  scorecard?: ScorecardPolicyConfig;
+  pattern?: DAGPatternInstanceMeta;
+  image?: string;
+  limits?: Record<string, unknown>;
+  git?: Record<string, unknown>;
+  workspace?: Record<string, unknown>;
+  agents?: Record<string, DAGAgentConfig>;
+  nodes?: Record<string, DAGNodeConfig>;
+}
+
+export interface DAGGraphNode {
+  node_id: string;
+  name: string;
+  description: string;
+  node_type: string;
+  agent: string;
+  after: string[];
+  outputs: Record<string, DAGOutputRoute>;
+  image?: string;
+  container_group?: string;
+  requires?: DAGNodeRequirements;
+  gateway_config?: DAGGatewayConfig;
+  extra?: Record<string, unknown>;
+}
+
+export interface DAGGraphData {
+  nodes: DAGGraphNode[];
+  edges: DAGEdge[];
+}
+
+export interface ParsedDAG {
+  meta: ResolvedWorkflowMeta;
+  graph: DAGGraphData;
+  loop_sources: string[];
+}

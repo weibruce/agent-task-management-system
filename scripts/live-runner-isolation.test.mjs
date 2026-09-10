@@ -1,0 +1,390 @@
+import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const cleanupScript = path.join(repoRoot, "scripts", "cleanup-dag-patterns-live-runner.sh");
+
+test("keeps local live-runner isolation separate from stable PR automation", () => {
+  const ci = fs.readFileSync(path.join(repoRoot, ".github", "workflows", "ci.yml"), "utf8");
+  const review = fs.readFileSync(path.join(repoRoot, ".github", "workflows", "pr-review.yml"), "utf8");
+  const actionlint = fs.readFileSync(path.join(repoRoot, ".github", "actionlint.yaml"), "utf8");
+  const runner = fs.readFileSync(path.join(repoRoot, "scripts", "run-dag-patterns-live-runner.sh"), "utf8");
+
+  assert.doesNotMatch(ci, /live-dag-patterns|live_patterns|wake_model|atms-live|ATMS_PATTERN_MODEL_BASE_URL/);
+  assert.doesNotMatch(actionlint, /- atms-live/);
+  assert.match(review, /runs-on: \[self-hosted, Linux, X64, atms-pr-review\]/);
+  assert.match(review, /run-pr-review-stable-runner\.sh/);
+  assert.doesNotMatch(review, /ATMS_LIVE_SLOT|ATMS_MANAGER_PORT/);
+  assert.match(actionlint, /- atms-pr-review/);
+  assert.match(runner, /org\.atms\.live_slot=\$LIVE_SLOT/);
+  assert.match(runner, /source "\$REPO_ROOT\/scripts\/lib\/worker-build-network\.sh"/);
+  assert.match(runner, /atms_worker_build_network_args/);
+  assert.match(runner, /ATMS_WORKER_BUILD_NETWORK_ARGS/);
+  assert.doesNotMatch(runner, /\beval\b/);
+  assert.match(runner, /LIVE_RUN_LABEL="org\.atms\.live_run_v2"/);
+  assert.match(runner, /--label "\$LIVE_RUN_LABEL=\$RUN_KEY"/);
+  assert.match(runner, /manager-port-allocation\.lock/);
+  assert.match(runner, /dag chats "\$REVIEW_RUN_ID" --tools 20 --raw-tools/);
+  assert.doesNotMatch(runner, /--timeout-ms/);
+  assert.match(runner, /--stall-timeout-ms/);
+
+  const acquire = runner.indexOf('flock -w 60 8');
+  const start = runner.indexOf('cli.js" start --host');
+  const cleanupStart = runner.indexOf("cleanup() {");
+  const cleanupRelease = runner.indexOf('flock -u 8', cleanupStart);
+  const cleanupRuntimeStop = runner.indexOf('cli.js" runtime stop', cleanupStart);
+  const releaseAfterStart = runner.indexOf('flock -u 8', start);
+  assert.ok(acquire >= 0 && acquire < start, "port lock must be held before Manager starts");
+  assert.ok(releaseAfterStart > start, "port lock must be released after Manager binds its port");
+  assert.ok(
+    cleanupRelease > cleanupStart && cleanupRelease < cleanupRuntimeStop,
+    "failure cleanup must release the port lock before stopping runtime resources",
+  );
+});
+
+test("cleanup fails closed when a custom home omits the matching runner root", { skip: process.platform !== "linux" }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "atms-live-runner-config-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const customHome = path.join(root, "custom-home");
+  const sentinel = path.join(customHome, "slots", "slot-a", "run-active", "sentinel");
+  fs.mkdirSync(path.dirname(sentinel), { recursive: true });
+  fs.writeFileSync(sentinel, "active");
+
+  const result = spawnSync("bash", [cleanupScript], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      HOME: path.join(root, "default-home"),
+      ATMS_RUNNER_BASE: "",
+      ATMS_LIVE_HOME_BASE: customHome,
+    },
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /ATMS_RUNNER_BASE is required/);
+  assert.equal(fs.readFileSync(sentinel, "utf8"), "active");
+});
+
+test("cleanup removes only one unlocked live runner slot", { skip: process.platform !== "linux" }, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "atms-live-runner-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const runnerBase = path.join(root, "runner");
+  const homeRoot = path.join(root, "home");
+  const fakeBin = path.join(root, "bin");
+  const dockerLog = path.join(root, "docker.log");
+  const runA = path.join(homeRoot, "slots", "slot-a", "run-a");
+  const runB = path.join(homeRoot, "slots", "slot-b", "run-b");
+  const legacyRun = path.join(homeRoot, "run-legacy");
+  fs.mkdirSync(fakeBin, { recursive: true });
+  fs.mkdirSync(runA, { recursive: true });
+  fs.mkdirSync(runB, { recursive: true });
+  fs.mkdirSync(legacyRun, { recursive: true });
+
+  const fakeDocker = `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$DOCKER_LOG"
+case "\${1:-}" in
+  ps)
+    case "$*" in
+      *live_slot=slot-a*) echo container-a ;;
+      *live_slot=slot-b*) echo container-b ;;
+      *live_run*) printf '%s\\n' container-legacy container-a container-b container-inspect-error ;;
+    esac
+    ;;
+  images)
+    case "$*" in
+      *live_slot=slot-a*) echo image-a ;;
+      *live_slot=slot-b*) echo image-b ;;
+      *live_run*) printf '%s\\n' image-legacy image-a image-b image-inspect-error ;;
+    esac
+    ;;
+  container)
+    id="\${!#}"
+    case "$id" in
+      container-a) echo slot-a ;;
+      container-b) echo slot-b ;;
+      container-legacy) ;;
+      container-inspect-error) exit 42 ;;
+    esac
+    ;;
+  image)
+    if [ "\${2:-}" = "inspect" ]; then
+      id="\${!#}"
+      case "$id" in
+        image-a) echo slot-a ;;
+        image-b) echo slot-b ;;
+        image-legacy) ;;
+        image-inspect-error) exit 42 ;;
+      esac
+    fi
+    ;;
+  rm)
+    if [ "\${FAIL_SLOT_A:-0}" = "1" ] && [[ "$*" == *container-a* ]]; then
+      exit 42
+    fi
+    ;;
+esac
+`;
+  const dockerPath = path.join(fakeBin, "docker");
+  fs.writeFileSync(dockerPath, fakeDocker, { mode: 0o755 });
+
+  const baseEnv = {
+    ...process.env,
+    PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+    DOCKER_LOG: dockerLog,
+    ATMS_RUNNER_BASE: runnerBase,
+    ATMS_LIVE_HOME_BASE: homeRoot,
+    ATMS_CLEANUP_LOCK_HELD: "0",
+  };
+  const runCleanup = (extraEnv = {}, expectedStatus = 0) => {
+    const result = spawnSync("bash", [cleanupScript], {
+      cwd: repoRoot,
+      env: { ...baseEnv, ATMS_LIVE_SLOT: "", ...extraEnv },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, expectedStatus, result.stderr);
+    return result;
+  };
+
+  runCleanup({ ATMS_LIVE_SLOT: "slot-a" });
+  assert.equal(fs.existsSync(runA), false);
+  assert.equal(fs.existsSync(runB), true);
+  assert.equal(fs.existsSync(legacyRun), true);
+  let removals = fs.readFileSync(dockerLog, "utf8").split("\n").filter((line) => /^(rm -f|image rm -f)/.test(line));
+  assert.deepEqual(removals, ["rm -f container-a", "image rm -f image-a"]);
+
+  fs.mkdirSync(runA, { recursive: true });
+  fs.writeFileSync(dockerLog, "");
+  runCleanup({ ATMS_LIVE_SLOT: "slot-a", ATMS_CLEANUP_LOCK_HELD: "1" });
+  assert.equal(fs.existsSync(runA), false);
+  removals = fs.readFileSync(dockerLog, "utf8").split("\n").filter((line) => /^(rm -f|image rm -f)/.test(line));
+  assert.deepEqual(removals, ["rm -f container-a", "image rm -f image-a"]);
+
+  fs.writeFileSync(dockerLog, "");
+  const slotBLock = path.join(runnerBase, "slots", "slot-b", "dag-patterns-live.lock");
+  const lockReady = path.join(root, "lock-ready");
+  fs.mkdirSync(path.dirname(slotBLock), { recursive: true });
+  const lockHolder = spawn("bash", ["-c", 'exec 9>"$1"; flock 9; : >"$2"; sleep 30', "bash", slotBLock, lockReady]);
+  t.after(() => lockHolder.kill("SIGTERM"));
+  for (let attempt = 0; attempt < 100 && !fs.existsSync(lockReady); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(fs.existsSync(lockReady), true, "slot lock holder did not start");
+
+  runCleanup();
+  assert.equal(fs.existsSync(legacyRun), false);
+  assert.equal(fs.existsSync(runB), true, "timer cleanup must skip a locked slot");
+  removals = fs.readFileSync(dockerLog, "utf8").split("\n").filter((line) => /^(rm -f|image rm -f)/.test(line));
+  assert.ok(removals.includes("rm -f container-legacy"));
+  assert.ok(removals.includes("image rm -f image-legacy"));
+  assert.ok(
+    removals.every(
+      (line) =>
+        !line.includes("container-b") &&
+        !line.includes("image-b") &&
+        !line.includes("container-inspect-error") &&
+        !line.includes("image-inspect-error"),
+    ),
+  );
+
+  if (lockHolder.exitCode === null) {
+    lockHolder.kill("SIGTERM");
+    await new Promise((resolve) => lockHolder.once("exit", resolve));
+  }
+  runCleanup();
+  assert.equal(fs.existsSync(runB), false);
+  removals = fs.readFileSync(dockerLog, "utf8").split("\n").filter((line) => /^(rm -f|image rm -f)/.test(line));
+  assert.ok(removals.includes("rm -f container-b"));
+  assert.ok(removals.includes("image rm -f image-b"));
+
+  fs.mkdirSync(runA, { recursive: true });
+  fs.mkdirSync(runB, { recursive: true });
+  fs.writeFileSync(dockerLog, "");
+  const failedCleanup = runCleanup({ FAIL_SLOT_A: "1" }, 1);
+  assert.match(failedCleanup.stderr, /Cleanup failed for live runner slot slot-a/);
+  assert.equal(fs.existsSync(runA), false);
+  assert.equal(fs.existsSync(runB), false, "a failed slot must not prevent later slot cleanup");
+  removals = fs.readFileSync(dockerLog, "utf8").split("\n").filter((line) => /^(rm -f|image rm -f)/.test(line));
+  assert.ok(removals.includes("rm -f container-b"));
+  assert.ok(removals.includes("image rm -f image-b"));
+});
+
+
+test("live runner builds the worker image through the shared build network contract", { skip: process.platform !== "linux" }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "atms-live-runner-build-network-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const runnerBase = path.join(root, "runner");
+  const homeRoot = path.join(root, "home");
+  const artifactRoot = path.join(root, "artifacts");
+  const fakeBin = path.join(root, "bin");
+  const fakeHome = path.join(root, "user-home");
+  const capturePath = path.join(root, "docker-build-args.txt");
+  fs.mkdirSync(fakeBin, { recursive: true });
+  fs.mkdirSync(fakeHome, { recursive: true });
+
+  // The sandbox stages a partial repository. Every sandbox that sources or
+  // executes scripts/lib/worker-build-network.sh must also copy the delegated
+  // Worker helper to its exact repository-relative path, or the shared
+  // contract must fail closed instead of silently keeping unknown sources.
+  const sourceRoot = path.join(root, "repo");
+  for (const relative of [
+    "scripts/run-dag-patterns-live-runner.sh",
+    "scripts/cleanup-dag-patterns-live-runner.sh",
+    "scripts/lib/worker-build-network.sh",
+    "atms_worker/scripts/configure-apt-sources.mjs",
+    "atms_worker/Dockerfile",
+  ]) {
+    const target = path.join(sourceRoot, relative);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(path.join(repoRoot, relative), target);
+    fs.chmodSync(target, 0o755);
+  }
+
+  const fakeCommand = (name, content) => {
+    fs.writeFileSync(path.join(fakeBin, name), content, { mode: 0o755 });
+  };
+
+  fakeCommand("docker", "#!/usr/bin/env bash\nif [ \"${1:-}\" = build ]; then printf '%s\\n' \"$@\" > \"$CAPTURE_DOCKER_BUILD_ARGS\"; fi\nexit 0\n");
+  fakeCommand("curl", "#!/usr/bin/env bash\nexit 0\n");
+  fakeCommand("python3", "#!/usr/bin/env bash\nexit 0\n");
+  fakeCommand("ss", "#!/usr/bin/env bash\nexit 0\n");
+  fakeCommand("node", "#!/usr/bin/env bash\nfor arg in \"$@\"; do\n  if [ \"$arg\" = start ]; then exit 3; fi\ndone\nexit 0\n");
+
+  // The shared helper delegates URL validation to ${NODE_BIN:-node}. The shim
+  // captures the exact argv handed to Node before delegating to the real
+  // binary: only environment variable names may cross the boundary, never
+  // source or proxy values.
+  const argvLog = path.join(root, "node-argv.txt");
+  const nodeShim = path.join(root, "node-shim.sh");
+  fs.writeFileSync(
+    nodeShim,
+    `#!/usr/bin/env bash
+printf '%s\\n' "$@" >> "$ARGV_LOG"
+exec "${process.execPath}" "$@"
+`,
+    { mode: 0o755 },
+  );
+
+  const baseEnv = {
+    PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+    HOME: fakeHome,
+    NODE_BIN: nodeShim,
+    ARGV_LOG: argvLog,
+    GITHUB_RUN_ID: "contract",
+    GITHUB_RUN_ATTEMPT: "1",
+    ATMS_RUNNER_BASE: runnerBase,
+    ATMS_LIVE_HOME_BASE: homeRoot,
+    ATMS_LIVE_ARTIFACTS: artifactRoot,
+    ATMS_LIVE_REPORT_PATH: path.join(root, "report", "dag-patterns-live.json"),
+    ATMS_LIVE_SLOT: "buildnet",
+    ATMS_LIVE_PATTERNS: "handoff-contracts",
+    ATMS_PATTERN_MODEL_BASE_URL: "http://model.contract.test",
+    ATMS_DAG_APPROVAL_TOKEN: "contract-approval-token",
+    ATMS_DAG_MUTATION_TOKEN: "contract-mutation-token",
+    ATMS_MANAGER_ADMIN_TOKEN: "contract-admin-token",
+    ATMS_WORKER_BUILD_APT_MIRROR: "",
+    ATMS_WORKER_BUILD_APT_SECURITY_MIRROR: "",
+    ATMS_WORKER_BUILD_NPM_REGISTRY: "",
+    ATMS_WORKER_BUILD_DSH_GIT_REMOTE: "",
+    HTTP_PROXY: "",
+    HTTPS_PROXY: "",
+    NO_PROXY: "",
+    http_proxy: "",
+    https_proxy: "",
+    no_proxy: "",
+  };
+
+  const runnerScript = path.join(sourceRoot, "scripts", "run-dag-patterns-live-runner.sh");
+  const runRunner = (extraEnv = {}) => {
+    fs.rmSync(capturePath, { force: true });
+    return spawnSync("bash", [runnerScript], {
+      cwd: sourceRoot,
+      encoding: "utf8",
+      env: { ...baseEnv, CAPTURE_DOCKER_BUILD_ARGS: capturePath, ...extraEnv },
+    });
+  };
+
+  // The fake Manager start exits 3 after the Worker image build, so a healthy
+  // run is observed through the captured Docker argv, not the exit status.
+  const baseline = runRunner();
+  assert.equal(baseline.status, 3, baseline.stderr);
+  assert.deepEqual(fs.readFileSync(capturePath, "utf8").trim().split("\n"), [
+    "build",
+    "--label",
+    "org.atms.live_run_v2=contract-1",
+    "--label",
+    "org.atms.live_slot=buildnet",
+    "-t",
+    "atms-worker:dag-live-contract-1",
+    "-f",
+    path.join(sourceRoot, "atms_worker", "Dockerfile"),
+    sourceRoot,
+  ]);
+
+  const custom = runRunner({
+    ATMS_WORKER_BUILD_APT_MIRROR: "https://deb.live.example/debian/",
+    ATMS_WORKER_BUILD_NPM_REGISTRY: "https://npm.live.example",
+    ATMS_WORKER_BUILD_DSH_GIT_REMOTE: "https://git.live.example/deepseek-harness.git",
+  });
+  assert.equal(custom.status, 3, custom.stderr);
+  const customArgs = fs.readFileSync(capturePath, "utf8");
+  assert.match(customArgs, /--build-arg\nATMS_WORKER_BUILD_APT_MIRROR=https:\/\/deb\.live\.example\/debian\n/);
+  assert.match(customArgs, /--build-arg\nNPM_CONFIG_REGISTRY=https:\/\/npm\.live\.example\n/);
+  assert.match(customArgs, /--build-arg\nATMS_DSH_FORK_REPOSITORY=https:\/\/git\.live\.example\/deepseek-harness\.git\n/);
+  assert.doesNotMatch(customArgs, /ATMS_WORKER_BUILD_APT_SECURITY_MIRROR/);
+
+  const proxy = runRunner({
+    HTTPS_PROXY: "http://proxy.live.example:3128",
+    no_proxy: "localhost",
+    HTTP_PROXY: " \t ",
+    https_proxy: "\n ",
+    NO_PROXY: "   ",
+  });
+  assert.equal(proxy.status, 3, proxy.stderr);
+  const proxyArgs = fs.readFileSync(capturePath, "utf8");
+  const proxyArgLines = proxyArgs.split("\n");
+  const valuelessProxyArgs = [];
+  for (let index = 0; index < proxyArgLines.length - 1; index += 1) {
+    if (proxyArgLines[index] === "--build-arg" && !proxyArgLines[index + 1].includes("=")) {
+      valuelessProxyArgs.push(proxyArgLines[index + 1]);
+    }
+  }
+  assert.deepEqual(valuelessProxyArgs, ["HTTPS_PROXY", "no_proxy"]);
+  assert.doesNotMatch(proxyArgs, /proxy\.live\.example/);
+
+  const capturedArgv = fs.readFileSync(argvLog, "utf8");
+  assert.match(capturedArgv, /--print-env/);
+  assert.match(capturedArgv, /configure-apt-sources\.mjs/);
+  for (const expected of [
+    "ATMS_WORKER_BUILD_APT_MIRROR",
+    "ATMS_WORKER_BUILD_APT_SECURITY_MIRROR",
+    "ATMS_WORKER_BUILD_NPM_REGISTRY",
+    "ATMS_WORKER_BUILD_DSH_GIT_REMOTE",
+  ]) {
+    assert.ok(capturedArgv.includes(expected), `delegation must name ${expected} only`);
+  }
+  for (const prohibited of [
+    "https://deb.live.example/debian/",
+    "https://npm.live.example",
+    "https://git.live.example/deepseek-harness.git",
+    "http://proxy.live.example:3128",
+    "http://user:pass@deb.live.example",
+  ]) {
+    assert.ok(!capturedArgv.includes(prohibited), "source and proxy values must never reach argv");
+  }
+
+  const invalid = runRunner({ ATMS_WORKER_BUILD_APT_MIRROR: "http://user:pass@deb.live.example" });
+  assert.equal(invalid.status, 1, invalid.stderr);
+  assert.match(invalid.stderr, /ATMS_WORKER_BUILD_APT_MIRROR/);
+  assert.doesNotMatch(invalid.stderr, /user:pass/);
+  assert.equal(fs.existsSync(capturePath), false);
+});

@@ -1,0 +1,863 @@
+import * as http from "node:http";
+import {
+  getDefaultProviders,
+  getProvider,
+  upsertProvider,
+  updateProvider,
+  deleteProvider,
+  listSettings,
+  getSetting,
+  createSetting,
+  updateSetting,
+  deleteSetting,
+  maskApiKey,
+  resolveCodexResponsesBaseUrlForSetting,
+  type LLMSetting,
+  type LLMPlanType,
+  type LLMProtocol,
+  type LLMAuthType,
+  type ProviderInput,
+} from "../persistence/llm-settings.js";
+import { normalizeOpenAiBaseUrl } from "./openai-url.js";
+
+interface BaseResponse {
+  success: boolean;
+  message: string;
+  data?: unknown;
+  error?: string;
+}
+
+function json(res: http.ServerResponse, status: number, body: BaseResponse) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+function _badRequest(res: http.ServerResponse, message: string) {
+  json(res, 400, { success: false, message, error: message });
+}
+
+function _notFound(res: http.ServerResponse, message: string) {
+  json(res, 404, { success: false, message, error: message });
+}
+
+function _conflict(res: http.ServerResponse, message: string) {
+  json(res, 409, { success: false, message, error: message });
+}
+
+function _ok(res: http.ServerResponse, message: string, data?: unknown) {
+  json(res, 200, { success: true, message, data });
+}
+
+function _normalizedBaseUrl(value: string): string {
+  return value.trim().replace(/\/+$/, "");
+}
+
+function _isOpenSpeechBaseUrl(value: string): boolean {
+  const normalized = _normalizedBaseUrl(value);
+  return normalized === "https://openspeech.bytedance.com/api/v3" ||
+    normalized === "https://openspeech.bytedance.com/api/v3/plan";
+}
+
+function _catalogModelsForBaseUrl(baseUrl: string): string[] | undefined {
+  if (!_isOpenSpeechBaseUrl(baseUrl)) return undefined;
+  const endpoint = getDefaultProviders()
+    .flatMap((provider) => provider.endpoints ?? [])
+    .find((candidate) => candidate.protocol === "volcengine_openspeech");
+  return endpoint?.models.map((model) => model.id) ?? [];
+}
+
+function _modelProbeUrls(baseUrl: string): string[] {
+  const normalized = normalizeOpenAiBaseUrl(baseUrl);
+  if (!normalized) return [];
+  if (normalized.endsWith("/models")) return [normalized];
+  if (normalized.endsWith("/v1")) {
+    return [`${normalized}/models`, `${normalized.slice(0, -3)}/models`];
+  }
+  return [`${normalized}/models`, `${normalized}/v1/models`];
+}
+
+function _modelsFromProbePayload(payload: unknown): string[] | undefined {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  const rec = payload as Record<string, unknown>;
+  const rawModels = Array.isArray(rec.data)
+    ? rec.data
+    : Array.isArray(rec.models)
+      ? rec.models
+      : undefined;
+  if (!rawModels) return undefined;
+  return Array.from(new Set(rawModels
+    .map((item) => typeof item === "string"
+      ? item.trim()
+      : item && typeof item === "object" && typeof (item as Record<string, unknown>).id === "string"
+        ? String((item as Record<string, unknown>).id).trim()
+        : "")
+    .filter(Boolean)))
+    .sort();
+}
+
+function _modelProbeBaseUrlForSetting(setting: LLMSetting): string {
+  const provider = getProvider(setting.provider_id);
+  const endpoint = provider?.endpoints?.find((candidate) => candidate.id === setting.endpoint_id);
+  const baseUrl = setting.chat_completions_base_url ?? setting.base_url ??
+    endpoint?.chat_completions_base_url ?? endpoint?.base_url ??
+    provider?.chat_completions_base_url ?? provider?.base_url ?? "";
+  return _normalizedBaseUrl(baseUrl);
+}
+
+type MainModelHarness = "codex_appserver" | "claude_agent_sdk" | "kimi_code";
+
+interface MainModelEndpointProbe {
+  available: boolean;
+  url: string;
+  base_url?: string;
+  attempted_urls: string[];
+  status?: number;
+  error?: string;
+}
+
+type MainModelEndpointKind = "anthropic" | "openai" | "responses";
+
+function _mainModelBaseUrlCandidates(baseUrl: string): string[] {
+  let normalized = normalizeOpenAiBaseUrl(baseUrl);
+  if (normalized.endsWith("/messages")) {
+    normalized = _normalizedBaseUrl(normalized.slice(0, -"/messages".length));
+  }
+  const candidates = normalized.endsWith("/v1")
+    ? [normalized, normalized.slice(0, -3)]
+    : [`${normalized}/v1`, normalized];
+  return Array.from(new Set(candidates.map(_normalizedBaseUrl).filter(Boolean)));
+}
+
+function _mainModelEndpointPath(endpoint: MainModelEndpointKind): string {
+  if (endpoint === "anthropic") return "messages";
+  if (endpoint === "responses") return "responses";
+  return "chat/completions";
+}
+
+function _modelProbeHeaders(apiKey: string, anthropic: boolean): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    ...(apiKey
+      ? {
+          Authorization: `Bearer ${apiKey}`,
+          "x-api-key": apiKey,
+        }
+      : {}),
+    ...(anthropic ? { "anthropic-version": "2023-06-01" } : {}),
+  };
+}
+
+async function _probeMainModelEndpoint(input: {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  endpoint: MainModelEndpointKind;
+}): Promise<MainModelEndpointProbe> {
+  const anthropic = input.endpoint === "anthropic";
+  const endpointPath = _mainModelEndpointPath(input.endpoint);
+  const body = input.endpoint === "anthropic"
+    ? {
+        model: input.model,
+        max_tokens: 1,
+        messages: [{ role: "user", content: "Reply with OK." }],
+      }
+    : input.endpoint === "responses"
+      ? {
+          model: input.model,
+          max_output_tokens: 1,
+          stream: false,
+          input: "Reply with OK.",
+        }
+      : {
+          model: input.model,
+          max_tokens: 1,
+          stream: false,
+          messages: [{ role: "user", content: "Reply with OK." }],
+        };
+  const failures: Array<{ url: string; status?: number; error: string }> = [];
+  for (const baseUrl of _mainModelBaseUrlCandidates(input.baseUrl)) {
+    const url = `${baseUrl}/${endpointPath}`;
+    try {
+      const upstream = await fetch(url, {
+        method: "POST",
+        headers: _modelProbeHeaders(input.apiKey, anthropic),
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15_000),
+      });
+      const responseText = await upstream.text().catch(() => "");
+      if (!upstream.ok) {
+        failures.push({
+          url,
+          status: upstream.status,
+          error: `HTTP ${upstream.status}${responseText ? `: ${responseText.slice(0, 240)}` : ""}`,
+        });
+        continue;
+      }
+      return {
+        available: true,
+        url,
+        base_url: baseUrl,
+        attempted_urls: [...failures.map((failure) => failure.url), url],
+        status: upstream.status,
+      };
+    } catch (err) {
+      failures.push({
+        url,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  const lastFailure = failures[failures.length - 1];
+  return {
+    available: false,
+    url: failures[0]?.url ?? `${_normalizedBaseUrl(input.baseUrl)}/${endpointPath}`,
+    attempted_urls: failures.map((failure) => failure.url),
+    status: lastFailure?.status,
+    error: failures.map((failure) => `${failure.url}: ${failure.error}`).join("; ") || "No endpoint candidates",
+  };
+}
+
+async function _detectMainModelRuntime(input: {
+  baseUrl: string;
+  anthropicBaseUrl?: string;
+  openAiBaseUrl?: string;
+  responsesBaseUrl?: string;
+  apiKey: string;
+  model: string;
+}): Promise<{
+  available: boolean;
+  preferred_harness: MainModelHarness | null;
+  endpoints: {
+    anthropic: MainModelEndpointProbe;
+    openai: MainModelEndpointProbe;
+    responses: MainModelEndpointProbe;
+  };
+}> {
+  const [anthropic, openai, responses] = await Promise.all([
+    _probeMainModelEndpoint({ ...input, baseUrl: input.anthropicBaseUrl ?? input.baseUrl, endpoint: "anthropic" }),
+    _probeMainModelEndpoint({ ...input, baseUrl: input.openAiBaseUrl ?? input.baseUrl, endpoint: "openai" }),
+    _probeMainModelEndpoint({ ...input, baseUrl: input.responsesBaseUrl ?? input.baseUrl, endpoint: "responses" }),
+  ]);
+  // Codex is the preferred provider-backed harness when Responses is really
+  // available. Claude and Kimi remain compatibility fallbacks.
+  const preferredHarness: MainModelHarness | null = responses.available
+    ? "codex_appserver"
+    : anthropic.available
+      ? "claude_agent_sdk"
+      : openai.available
+        ? "kimi_code"
+        : null;
+  return {
+    available: preferredHarness !== null,
+    preferred_harness: preferredHarness,
+    endpoints: { anthropic, openai, responses },
+  };
+}
+
+function _created(res: http.ServerResponse, message: string, data: unknown) {
+  json(res, 201, { success: true, message, data });
+}
+
+async function _readJsonBody(req: http.IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => { data += chunk; });
+    req.on("end", () => {
+      try {
+        resolve(data ? JSON.parse(data) : {});
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function _capabilities(setting: LLMSetting): string[] {
+  const caps: string[] = [];
+  if (setting.supports_llm) caps.push("llm");
+  if (setting.supports_asr) caps.push("asr");
+  if (setting.supports_tts) caps.push("tts");
+  if (setting.supports_audio_input) caps.push("audio_input");
+  if (setting.supports_image_input) caps.push("vision");
+  if (setting.supports_video_input) caps.push("video_input");
+  return caps;
+}
+
+function _maskSetting(setting: LLMSetting) {
+  const provider = getProvider(setting.provider_id);
+  const endpoint = provider?.endpoints?.find((item) => item.id === setting.endpoint_id);
+  const baseUrl = setting.base_url ?? endpoint?.base_url ?? provider?.base_url;
+  const chatBaseUrl = setting.chat_completions_base_url ?? endpoint?.chat_completions_base_url ??
+    provider?.chat_completions_base_url;
+  const responsesBaseUrl = setting.responses_base_url ?? endpoint?.responses_base_url ?? provider?.responses_base_url;
+  const anthropicBaseUrl = setting.anthropic_base_url ?? endpoint?.anthropic_base_url ?? provider?.anthropic_base_url;
+  const apiKey = maskApiKey(setting.api_key);
+  return {
+    ...setting,
+    provider_name: provider?.name ?? setting.provider_id,
+    provider_source: provider?.source,
+    provider_readonly: provider?.readonly,
+    provider_base_url: baseUrl,
+    chat_completions_base_url: chatBaseUrl,
+    responses_base_url: responsesBaseUrl,
+    anthropic_base_url: anthropicBaseUrl,
+    supports_codex_responses: Boolean(resolveCodexResponsesBaseUrlForSetting(setting)),
+    endpoint_name: setting.endpoint_name ?? endpoint?.name,
+    api_key: apiKey,
+    api_key_display: apiKey,
+    capabilities: _capabilities(setting),
+  };
+}
+
+const SETTINGS_BASE_PATHS = ["/api/llm-settings", "/api/llm/settings"];
+
+function _isSettingsBasePath(pathname: string): boolean {
+  return SETTINGS_BASE_PATHS.includes(pathname);
+}
+
+function _settingsIdFromPath(pathname: string): string | undefined {
+  for (const basePath of SETTINGS_BASE_PATHS) {
+    const prefix = `${basePath}/`;
+    if (pathname.startsWith(prefix)) {
+      const id = pathname.slice(prefix.length);
+      return id && !id.includes("/") ? decodeURIComponent(id) : undefined;
+    }
+  }
+  return undefined;
+}
+
+function _requiredString(body: Record<string, unknown>, field: string): string | undefined {
+  const value = body[field];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function _planType(value: unknown): LLMPlanType | undefined {
+  return value === "api_billing" || value === "token_plan" || value === "coding_plan" ||
+      value === "agent_plan" || value === "subscription" || value === "custom"
+    ? value
+    : undefined;
+}
+
+function _protocol(value: unknown): LLMProtocol | undefined {
+  return value === "openai_compatible" || value === "anthropic_compatible" || value === "dashscope_native" ||
+      value === "volcengine_doubao_voice" || value === "volcengine_ark_voice" ||
+      value === "volcengine_openspeech" || value === "custom"
+    ? value
+    : undefined;
+}
+
+function _authType(value: unknown): LLMAuthType | undefined {
+  return value === "bearer" || value === "api-key" || value === "x-api-key" || value === "subscription-key" ||
+      value === "custom"
+    ? value
+    : undefined;
+}
+
+function _voiceAdapter(value: unknown): ProviderInput["voice_adapter"] {
+  return value === "openai_audio" || value === "mimo_audio" ||
+      value === "volcengine_doubao_voice" || value === "volcengine_ark_voice" ||
+      value === "volcengine_openspeech" || value === "custom"
+    ? value
+    : undefined;
+}
+
+function _reasoningEffortMap(value: unknown): Record<string, string | null> | false | undefined {
+  if (value === false) return false;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value);
+  if (entries.length === 0) return undefined;
+  const normalized: Record<string, string | null> = {};
+  for (const [rawSelector, rawWireValue] of entries) {
+    const selector = rawSelector.trim();
+    if (!selector || (rawWireValue !== null && (typeof rawWireValue !== "string" || !rawWireValue.trim()))) {
+      return undefined;
+    }
+    normalized[selector] = typeof rawWireValue === "string" ? rawWireValue.trim() : null;
+  }
+  return normalized;
+}
+
+function _reasoningEffortMapField(
+  body: Record<string, unknown>,
+): Record<string, string | null> | false | undefined {
+  if (!Object.prototype.hasOwnProperty.call(body, "reasoning_effort_map")) return undefined;
+  const parsed = _reasoningEffortMap(body.reasoning_effort_map);
+  if (parsed === undefined) {
+    throw new Error("reasoning_effort_map must be false or a non-empty selector-to-wire-value object");
+  }
+  return parsed;
+}
+
+function _providerBody(body: Record<string, unknown>, idOverride?: string): ProviderInput {
+  return {
+    id: idOverride ?? _requiredString(body, "id") ?? "",
+    name: typeof body.name === "string" ? body.name : undefined,
+    status: body.status === "paused" ? "paused" as const : body.status === "active" ? "active" as const : undefined,
+    default_model: _requiredString(body, "default_model") ??
+      (typeof body.defaultModel === "string" ? body.defaultModel.trim() : undefined),
+    base_url: typeof body.base_url === "string" ? body.base_url : undefined,
+    chat_completions_base_url: typeof body.chat_completions_base_url === "string"
+      ? body.chat_completions_base_url
+      : undefined,
+    responses_base_url: typeof body.responses_base_url === "string" ? body.responses_base_url : undefined,
+    anthropic_base_url: typeof body.anthropic_base_url === "string" ? body.anthropic_base_url : undefined,
+    voice_adapter: _voiceAdapter(body.voice_adapter),
+    tts_http_url: typeof body.tts_http_url === "string" ? body.tts_http_url : undefined,
+    tts_realtime_url: typeof body.tts_realtime_url === "string" ? body.tts_realtime_url : undefined,
+    asr_realtime_url: typeof body.asr_realtime_url === "string" ? body.asr_realtime_url : undefined,
+    asr_async_url: typeof body.asr_async_url === "string" ? body.asr_async_url : undefined,
+    supports_llm: typeof body.supports_llm === "boolean" ? body.supports_llm : undefined,
+    supports_asr: typeof body.supports_asr === "boolean" ? body.supports_asr : undefined,
+    supports_tts: typeof body.supports_tts === "boolean" ? body.supports_tts : undefined,
+    supports_audio_input: typeof body.supports_audio_input === "boolean" ? body.supports_audio_input : undefined,
+    supports_image_input: typeof body.supports_image_input === "boolean" ? body.supports_image_input : undefined,
+    supports_video_input: typeof body.supports_video_input === "boolean" ? body.supports_video_input : undefined,
+  };
+}
+
+function _settingCreateBody(b: Record<string, unknown>) {
+  return {
+    provider_id: _requiredString(b, "provider_id"),
+    model_name: _requiredString(b, "model_name"),
+    // 多模型凭证：models 是字符串数组，第一个作为 model_name（向后兼容）
+    models: Array.isArray(b.models) && b.models.every((m) => typeof m === "string")
+      ? b.models as string[]
+      : undefined,
+    api_key: _requiredString(b, "api_key"),
+    reuse_existing_api_key: b.reuse_existing_api_key === true,
+    display_name: _requiredString(b, "display_name") ?? _requiredString(b, "alias"),
+    alias: _requiredString(b, "alias"),
+    endpoint_id: _requiredString(b, "endpoint_id"),
+    endpoint_name: _requiredString(b, "endpoint_name"),
+    plan_type: _planType(b.plan_type),
+    protocol: _protocol(b.protocol),
+    auth_type: _authType(b.auth_type),
+    key_hint: _requiredString(b, "key_hint"),
+    base_url: typeof b.base_url === "string" ? b.base_url : undefined,
+    chat_completions_base_url: typeof b.chat_completions_base_url === "string" ? b.chat_completions_base_url : undefined,
+    responses_base_url: typeof b.responses_base_url === "string" ? b.responses_base_url : undefined,
+    anthropic_base_url: typeof b.anthropic_base_url === "string" ? b.anthropic_base_url : undefined,
+    resource_id: _requiredString(b, "resource_id"),
+    voice_adapter: _requiredString(b, "voice_adapter"),
+    tts_http_url: _requiredString(b, "tts_http_url"),
+    tts_realtime_url: _requiredString(b, "tts_realtime_url"),
+    tts_bidirectional_url: _requiredString(b, "tts_bidirectional_url"),
+    asr_realtime_url: _requiredString(b, "asr_realtime_url"),
+    asr_async_url: _requiredString(b, "asr_async_url"),
+    tts_voice: _requiredString(b, "tts_voice"),
+    tts_format: _requiredString(b, "tts_format"),
+    tts_sample_rate: typeof b.tts_sample_rate === "number" ? b.tts_sample_rate : undefined,
+    is_active: typeof b.is_active === "boolean" ? b.is_active : undefined,
+    is_default: typeof b.is_default === "boolean" ? b.is_default : undefined,
+    supports_llm: typeof b.supports_llm === "boolean" ? b.supports_llm : undefined,
+    supports_asr: typeof b.supports_asr === "boolean" ? b.supports_asr : undefined,
+    supports_tts: typeof b.supports_tts === "boolean" ? b.supports_tts : undefined,
+    supports_audio_input: typeof b.supports_audio_input === "boolean" ? b.supports_audio_input : undefined,
+    supports_image_input: typeof b.supports_image_input === "boolean" ? b.supports_image_input : undefined,
+    supports_video_input: typeof b.supports_video_input === "boolean" ? b.supports_video_input : undefined,
+    reasoning_effort_map: _reasoningEffortMapField(b),
+    default_reasoning_effort: _requiredString(b, "default_reasoning_effort"),
+  };
+}
+
+export function llmSettingsRoutesHandler(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): boolean {
+  const requestUrl = new URL(req.url || "/", "http://localhost");
+  const pathname = requestUrl.pathname;
+
+  // GET /api/providers or frontend-compatible GET /api/llm/providers
+  if ((pathname === "/api/providers" || pathname === "/api/llm/providers") && req.method === "GET") {
+    const providers = getDefaultProviders();
+    _ok(res, `Found ${providers.length} providers`, { providers, total: providers.length });
+    return true;
+  }
+
+  // POST /api/providers or /api/llm/providers
+  if ((pathname === "/api/providers" || pathname === "/api/llm/providers") && req.method === "POST") {
+    _readJsonBody(req)
+      .then((body) => {
+        try {
+          const provider = upsertProvider(_providerBody(body as Record<string, unknown>));
+          _created(res, "Provider upserted", provider);
+        } catch (err) {
+          _badRequest(res, err instanceof Error ? err.message : String(err));
+        }
+      })
+      .catch((err) => {
+        _badRequest(res, err instanceof Error ? err.message : "Invalid JSON body");
+      });
+    return true;
+  }
+
+  const providerModelsMatch = pathname.match(/^\/api\/(?:llm\/)?providers\/([^/]+)\/models$/);
+  if (providerModelsMatch && req.method === "GET") {
+    const id = decodeURIComponent(providerModelsMatch[1]);
+    const provider = getProvider(id);
+    if (!provider) {
+      _notFound(res, `Provider not found: ${id}`);
+      return true;
+    }
+    const models = Array.from(new Set((provider.endpoints ?? []).flatMap((endpoint) =>
+      endpoint.models.length ? endpoint.models.map((model) => model.id) : [endpoint.default_model]
+    ).filter(Boolean)));
+    _ok(res, "Provider models retrieved", {
+      provider_id: provider.id,
+      provider_name: provider.name,
+      models,
+    });
+    return true;
+  }
+
+  if (pathname === "/api/llm/models/common" && req.method === "GET") {
+    const models: Record<string, string[]> = {};
+    for (const provider of getDefaultProviders()) {
+      models[provider.id] = Array.from(new Set((provider.endpoints ?? []).flatMap((endpoint) =>
+        endpoint.models.length ? endpoint.models.map((model) => model.id) : [endpoint.default_model]
+      ).filter(Boolean)));
+    }
+    _ok(res, "Common models retrieved", { models });
+    return true;
+  }
+
+  // POST /api/llm/models/probe — 动态探测供应商可用模型
+  // 已保存的凭证只传 setting_id，由 Manager 解密；新凭证仍可传 base_url + api_key。
+  // API key 始终由后端代理调用供应商，不回传浏览器。
+  if (pathname === "/api/llm/models/probe" && req.method === "POST") {
+    _readJsonBody(req)
+      .then(async (body) => {
+        const b = body as Record<string, unknown>;
+        const settingId = typeof b.setting_id === "string" ? b.setting_id.trim() : "";
+        const setting = settingId ? getSetting(settingId) : undefined;
+        if (settingId && !setting) {
+          _notFound(res, `LLM setting not found: ${settingId}`);
+          return;
+        }
+        const baseUrl = setting
+          ? _modelProbeBaseUrlForSetting(setting)
+          : typeof b.base_url === "string" ? _normalizedBaseUrl(b.base_url) : "";
+        const apiKey = setting?.api_key ?? (typeof b.api_key === "string" ? b.api_key.trim() : "");
+        if (!baseUrl) {
+          _badRequest(res, setting
+            ? `No model probe URL configured for LLM setting: ${setting.id}`
+            : "Missing required field: base_url");
+          return;
+        }
+        const catalogModels = _catalogModelsForBaseUrl(baseUrl);
+        if (catalogModels) {
+          _ok(res, `Probed ${catalogModels.length} catalog models`, { models: catalogModels });
+          return;
+        }
+        const headers: Record<string, string> = {};
+        if (apiKey) {
+          headers.Authorization = `Bearer ${apiKey}`;
+          headers["x-api-key"] = apiKey;
+        }
+        const failures: string[] = [];
+        for (const modelsUrl of _modelProbeUrls(baseUrl)) {
+          try {
+            const upstream = await fetch(modelsUrl, {
+              headers,
+              signal: AbortSignal.timeout(8000),
+            });
+            if (!upstream.ok) {
+              const text = await upstream.text().catch(() => "");
+              failures.push(`${modelsUrl}: HTTP ${upstream.status}${text ? `: ${text.slice(0, 160)}` : ""}`);
+              continue;
+            }
+            const payload = await upstream.json() as unknown;
+            const models = _modelsFromProbePayload(payload);
+            if (!models) {
+              failures.push(`${modelsUrl}: response did not contain a model list`);
+              continue;
+            }
+            _ok(res, `Probed ${models.length} models`, { models });
+            return;
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            failures.push(`${modelsUrl}: ${message}`);
+          }
+        }
+        _ok(res, "Probe failed", { models: [], error: failures.join("; ") });
+      })
+      .catch((err) => {
+        _badRequest(res, err instanceof Error ? err.message : "Invalid JSON body");
+      });
+    return true;
+  }
+
+  // POST /api/llm/models/detect-runtime — use the exact configured model to
+  // test Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses.
+  // Try versioned and unversioned roots without producing /v1/v1 paths.
+  if (pathname === "/api/llm/models/detect-runtime" && req.method === "POST") {
+    _readJsonBody(req)
+      .then(async (body) => {
+        const b = body as Record<string, unknown>;
+        const settingId = typeof b.setting_id === "string" ? b.setting_id.trim() : "";
+        const setting = settingId ? getSetting(settingId) : undefined;
+        if (settingId && !setting) {
+          _notFound(res, `LLM setting not found: ${settingId}`);
+          return;
+        }
+        const provider = setting ? getProvider(setting.provider_id) : undefined;
+        const endpoint = setting?.endpoint_id
+          ? provider?.endpoints?.find((candidate) => candidate.id === setting.endpoint_id)
+          : undefined;
+        const endpointBaseUrl = (field: "responses_base_url" | "anthropic_base_url" | "chat_completions_base_url"): string => (
+          setting
+            ? _normalizedBaseUrl(setting[field] ?? endpoint?.[field] ?? provider?.[field] ?? "")
+            : ""
+        );
+        const responsesBaseUrl = endpointBaseUrl("responses_base_url");
+        const anthropicBaseUrl = endpointBaseUrl("anthropic_base_url");
+        const openAiBaseUrl = endpointBaseUrl("chat_completions_base_url");
+        const baseUrl = setting
+          ? responsesBaseUrl || anthropicBaseUrl || openAiBaseUrl || _normalizedBaseUrl(setting.base_url ?? endpoint?.base_url ?? provider?.base_url ?? "")
+          : typeof b.base_url === "string" ? _normalizedBaseUrl(b.base_url) : "";
+        const apiKey = setting?.api_key ?? (typeof b.api_key === "string" ? b.api_key.trim() : "");
+        const model = setting?.model_name ?? (typeof b.model === "string" ? b.model.trim() : "");
+        if (!baseUrl) {
+          _badRequest(res, "Missing required field: base_url");
+          return;
+        }
+        if (!model) {
+          _badRequest(res, "Missing required field: model");
+          return;
+        }
+        const result = await _detectMainModelRuntime({
+          baseUrl,
+          apiKey,
+          model,
+          ...(setting
+            ? {
+                responsesBaseUrl: responsesBaseUrl || undefined,
+                anthropicBaseUrl: anthropicBaseUrl || undefined,
+                openAiBaseUrl: openAiBaseUrl || undefined,
+              }
+            : {}),
+        });
+        _ok(res, result.available ? "Main model runtime detected" : "Main model runtime unavailable", result);
+      })
+      .catch((err) => {
+        _badRequest(res, err instanceof Error ? err.message : "Invalid JSON body");
+      });
+    return true;
+  }
+
+  const providerMatch = pathname.match(/^\/api\/(?:llm\/)?providers\/([^/]+)$/);
+  if (providerMatch && req.method === "GET") {
+    const id = decodeURIComponent(providerMatch[1]);
+    const provider = getProvider(id);
+    if (!provider) {
+      _notFound(res, `Provider not found: ${id}`);
+      return true;
+    }
+    _ok(res, "Provider retrieved", provider);
+    return true;
+  }
+
+  if (providerMatch && req.method === "PUT") {
+    const id = decodeURIComponent(providerMatch[1]);
+    _readJsonBody(req)
+      .then((body) => {
+        try {
+          const provider = updateProvider(id, _providerBody(body as Record<string, unknown>, id));
+          _ok(res, "Provider updated", provider);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          if (message.includes("not found")) _notFound(res, message);
+          else _badRequest(res, message);
+        }
+      })
+      .catch((err) => {
+        _badRequest(res, err instanceof Error ? err.message : "Invalid JSON body");
+      });
+    return true;
+  }
+
+  if (providerMatch && req.method === "DELETE") {
+    const id = decodeURIComponent(providerMatch[1]);
+    const cascade = requestUrl.searchParams.get("cascade") === "true";
+    try {
+      const removed = deleteProvider(id, { cascade });
+      if (!removed) {
+        _notFound(res, `Provider not found: ${id}`);
+        return true;
+      }
+      _ok(res, "Provider deleted", { id, cascade });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes("is referenced by")) _conflict(res, message);
+      else _badRequest(res, message);
+    }
+    return true;
+  }
+
+  // GET /api/llm-settings
+  if (_isSettingsBasePath(pathname) && req.method === "GET") {
+    const url = new URL(req.url || "/", "http://localhost");
+    const providerId = url.searchParams.get("provider_id");
+    const settings = listSettings()
+      .filter((setting) => !providerId || setting.provider_id === providerId)
+      .map(_maskSetting);
+    _ok(res, `Found ${settings.length} settings`, { settings, total: settings.length });
+    return true;
+  }
+
+  // POST /api/llm-settings or /api/llm/settings
+  if (_isSettingsBasePath(pathname) && req.method === "POST") {
+    _readJsonBody(req)
+      .then((body) => {
+        const b = body as Record<string, unknown>;
+        const parsed = _settingCreateBody(b);
+        // 归一化 base_url：裸地址 / 带 /v1 / 完整端点地址统一存成 API 根，
+        // 避免运行期拼出 …/chat/completions/v1/chat/completions 这类坏 URL。
+        if (parsed.base_url) {
+          parsed.base_url = normalizeOpenAiBaseUrl(parsed.base_url);
+        }
+
+        if (!parsed.provider_id) {
+          _badRequest(res, "Missing required field: provider_id");
+          return;
+        }
+        if (!parsed.model_name) {
+          _badRequest(res, "Missing required field: model_name");
+          return;
+        }
+        if (parsed.api_key === "__reuse_existing__") {
+          _badRequest(res, "Reserved API key value: __reuse_existing__; use reuse_existing_api_key instead");
+          return;
+        }
+        if (parsed.api_key && parsed.reuse_existing_api_key) {
+          _badRequest(res, "api_key and reuse_existing_api_key are mutually exclusive");
+          return;
+        }
+        if (!parsed.api_key && !parsed.reuse_existing_api_key) {
+          _badRequest(res, "Missing required field: api_key");
+          return;
+        }
+
+        try {
+          const setting = createSetting({
+            ...parsed,
+            provider_id: parsed.provider_id,
+            model_name: parsed.model_name,
+            api_key: parsed.api_key ?? "",
+          });
+          _created(res, "Setting created", _maskSetting(setting));
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          _badRequest(res, message);
+        }
+      })
+      .catch((err) => {
+        _badRequest(res, err instanceof Error ? err.message : "Invalid JSON body");
+      });
+    return true;
+  }
+
+  // GET /api/llm-settings/:id or /api/llm/settings/:id
+  const settingsId = _settingsIdFromPath(pathname);
+  if (settingsId && req.method === "GET") {
+    const id = settingsId;
+    const setting = getSetting(id);
+    if (!setting) {
+      _notFound(res, `Setting not found: ${id}`);
+      return true;
+    }
+    _ok(res, "Setting retrieved", _maskSetting(setting));
+    return true;
+  }
+
+  // PUT /api/llm-settings/:id or /api/llm/settings/:id
+  if (settingsId && req.method === "PUT") {
+    const id = settingsId;
+    _readJsonBody(req)
+      .then((body) => {
+        const b = body as Record<string, unknown>;
+        const patch: Record<string, unknown> = {};
+        for (const field of ["provider_id", "model_name", "api_key"]) {
+          if (field in b && !_requiredString(b, field)) {
+            _badRequest(res, `Invalid field: ${field}`);
+            return;
+          }
+        }
+        if (typeof b.provider_id === "string") patch.provider_id = b.provider_id.trim();
+        if (typeof b.model_name === "string") patch.model_name = b.model_name.trim();
+        if (Array.isArray(b.models) && b.models.every((m) => typeof m === "string")) {
+          patch.models = b.models as string[];
+        }
+        if (typeof b.api_key === "string") patch.api_key = b.api_key.trim();
+        if (typeof b.display_name === "string") patch.display_name = b.display_name.trim();
+        if (typeof b.alias === "string") patch.display_name = b.alias.trim();
+        if (typeof b.endpoint_id === "string") patch.endpoint_id = b.endpoint_id.trim();
+        if (typeof b.endpoint_name === "string") patch.endpoint_name = b.endpoint_name.trim();
+        if (_planType(b.plan_type)) patch.plan_type = _planType(b.plan_type);
+        if (_protocol(b.protocol)) patch.protocol = _protocol(b.protocol);
+        if (_authType(b.auth_type)) patch.auth_type = _authType(b.auth_type);
+        if (typeof b.key_hint === "string") patch.key_hint = b.key_hint.trim();
+        if (typeof b.base_url === "string") patch.base_url = normalizeOpenAiBaseUrl(b.base_url);
+        if (typeof b.chat_completions_base_url === "string") {
+          patch.chat_completions_base_url = b.chat_completions_base_url;
+        }
+        if (typeof b.responses_base_url === "string") patch.responses_base_url = b.responses_base_url;
+        if (typeof b.anthropic_base_url === "string") patch.anthropic_base_url = b.anthropic_base_url;
+        if (typeof b.resource_id === "string") patch.resource_id = b.resource_id.trim();
+        if (typeof b.voice_adapter === "string") patch.voice_adapter = b.voice_adapter.trim();
+        if (typeof b.tts_http_url === "string") patch.tts_http_url = b.tts_http_url.trim();
+        if (typeof b.tts_realtime_url === "string") patch.tts_realtime_url = b.tts_realtime_url.trim();
+        if (typeof b.tts_bidirectional_url === "string") patch.tts_bidirectional_url = b.tts_bidirectional_url.trim();
+        if (typeof b.asr_realtime_url === "string") patch.asr_realtime_url = b.asr_realtime_url.trim();
+        if (typeof b.asr_async_url === "string") patch.asr_async_url = b.asr_async_url.trim();
+        if (typeof b.tts_voice === "string") patch.tts_voice = b.tts_voice.trim();
+        if (typeof b.tts_format === "string") patch.tts_format = b.tts_format.trim();
+        if (typeof b.tts_sample_rate === "number") patch.tts_sample_rate = b.tts_sample_rate;
+        if (typeof b.is_active === "boolean") patch.is_active = b.is_active;
+        if (typeof b.is_default === "boolean") patch.is_default = b.is_default;
+        if (typeof b.supports_llm === "boolean") patch.supports_llm = b.supports_llm;
+        if (typeof b.supports_asr === "boolean") patch.supports_asr = b.supports_asr;
+        if (typeof b.supports_tts === "boolean") patch.supports_tts = b.supports_tts;
+        if (typeof b.supports_audio_input === "boolean") patch.supports_audio_input = b.supports_audio_input;
+        if (typeof b.supports_image_input === "boolean") patch.supports_image_input = b.supports_image_input;
+        if (typeof b.supports_video_input === "boolean") patch.supports_video_input = b.supports_video_input;
+        if (Object.prototype.hasOwnProperty.call(b, "reasoning_effort_map")) {
+          patch.reasoning_effort_map = _reasoningEffortMapField(b);
+        }
+        if (typeof b.default_reasoning_effort === "string") {
+          patch.default_reasoning_effort = b.default_reasoning_effort.trim();
+        }
+
+        try {
+          const updated = updateSetting(id, patch);
+          _ok(res, "Setting updated", _maskSetting(updated));
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          if (message.includes("not found")) {
+            _notFound(res, message);
+          } else {
+            _badRequest(res, message);
+          }
+        }
+      })
+      .catch((err) => {
+        _badRequest(res, err instanceof Error ? err.message : "Invalid JSON body");
+      });
+    return true;
+  }
+
+  // DELETE /api/llm-settings/:id or /api/llm/settings/:id
+  if (settingsId && req.method === "DELETE") {
+    const id = settingsId;
+    const removed = deleteSetting(id);
+    if (!removed) {
+      _notFound(res, `Setting not found: ${id}`);
+      return true;
+    }
+    _ok(res, "Setting deleted", { id });
+    return true;
+  }
+
+  return false;
+}

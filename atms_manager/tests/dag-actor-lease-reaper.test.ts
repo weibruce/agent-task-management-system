@@ -1,0 +1,318 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import {
+  acquireDagActorLease,
+  getDagActorLease,
+  getLatestDagActorCheckpoint,
+  listDagProvisionedWorkers,
+  registerDagProvisionedWorker,
+  releaseDagActorLease,
+  retireDagActorLease,
+  setDagActorLeasePinned,
+  writeDagActorCheckpoint,
+} from "../src/persistence/dag-actor-leases.js";
+import { getDagActor, registerDagActor } from "../src/persistence/dag-actors.js";
+import { closeDb, getDb } from "../src/persistence/db.js";
+import { ensureRunDir, loadRunMetadata, writeRunMetadata } from "../src/persistence/store.js";
+import { reapDagActorLeases } from "../src/runtime/dag-actor-lease-reaper.js";
+import { _clearWorkers, registerWorker } from "../src/worker/registry.js";
+
+describe("DAG actor lease reaper", () => {
+  let home: string;
+  let oldHome: string | undefined;
+  let oldIdleTtl: string | undefined;
+  let now: number;
+
+  beforeEach(() => {
+    closeDb();
+    oldHome = process.env.ATMS_HOME;
+    oldIdleTtl = process.env.ATMS_DAG_WORKER_IDLE_TTL_MS;
+    home = fs.mkdtempSync(path.join(os.tmpdir(), "atms-dag-lease-reaper-"));
+    process.env.ATMS_HOME = home;
+    now = Date.now();
+    ensureRunDir("run-reaper");
+    registerDagActor({
+      run_id: "run-reaper",
+      actor_id: "actor-1",
+      node_id: "node-1",
+      role: "research",
+      surface_id: "surface-1",
+    });
+  });
+
+  afterEach(() => {
+    closeDb();
+    if (oldHome === undefined) delete process.env.ATMS_HOME;
+    else process.env.ATMS_HOME = oldHome;
+    if (oldIdleTtl === undefined) delete process.env.ATMS_DAG_WORKER_IDLE_TTL_MS;
+    else process.env.ATMS_DAG_WORKER_IDLE_TTL_MS = oldIdleTtl;
+    _clearWorkers();
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  function setRunStatus(status: "active" | "waiting" | "completed" | "failed" | "cancelled"): void {
+    const metadata = loadRunMetadata("run-reaper")!;
+    writeRunMetadata("run-reaper", {
+      ...metadata,
+      status,
+      ...(status === "active" || status === "waiting" ? {} : { completedAt: now }),
+    });
+  }
+
+  function acquireWorker(workerId = "worker-1"): ReturnType<typeof acquireDagActorLease> {
+    const lease = acquireDagActorLease({
+      run_id: "run-reaper",
+      actor_id: "actor-1",
+      target_type: "worker",
+      target_id: workerId,
+      idle_ttl_ms: 10,
+      retention_ttl_ms: 20,
+      now,
+    });
+    registerDagProvisionedWorker({
+      run_id: "run-reaper",
+      actor_id: "actor-1",
+      node_id: "node-1",
+      lease_generation: lease.lease_generation,
+      worker_id: workerId,
+      container_id: `container-${workerId}`,
+      docker_node_id: "docker-node-1",
+      now,
+    });
+    return lease;
+  }
+
+  function registerConnectedWorker(workerId: string): void {
+    registerWorker({
+      worker_id: workerId,
+      project_id: "",
+      socket: {} as never,
+      status: "connected",
+      capabilities: [],
+      registered_at: now,
+      last_heartbeat: now,
+    });
+  }
+
+  it("releases an idle waiting actor before deprovisioning its worker", async () => {
+    setRunStatus("waiting");
+    acquireWorker();
+    const seen: string[] = [];
+    const report = await reapDagActorLeases({
+      now: now + 10,
+      deprovisionFn: async () => {
+        const lease = getDagActorLease({ run_id: "run-reaper", actor_id: "actor-1" });
+        seen.push(lease?.state ?? "missing");
+        return { stopped: true, removed: true, dockerCleanupVerified: true };
+      },
+    });
+
+    expect(report).toMatchObject({ released: 1, worker_cleanup_attempted: 1, worker_cleanup_failed: 0 });
+    expect(seen).toEqual(["dormant"]);
+    expect(getDagActorLease({ run_id: "run-reaper", actor_id: "actor-1" })).toMatchObject({
+      state: "dormant",
+      lease_generation: 1,
+    });
+  });
+
+  it("renews an active long-running lease before it spends its hot TTL", async () => {
+    acquireWorker();
+    registerConnectedWorker("worker-1");
+    process.env.ATMS_DAG_WORKER_IDLE_TTL_MS = "10";
+    expect((await reapDagActorLeases({ now: now + 5 })).renewed).toBe(1);
+    expect(getDagActorLease({ run_id: "run-reaper", actor_id: "actor-1" })).toMatchObject({
+      state: "leased",
+      idle_deadline: now + 15,
+    });
+  });
+
+  it("releases a waiting actor when its provisioned Worker disconnects before idle expiry", async () => {
+    setRunStatus("waiting");
+    acquireWorker("worker-disconnected");
+
+    const report = await reapDagActorLeases({
+      now: now + 2,
+      deprovisionFn: async () => ({ stopped: true, removed: true, dockerCleanupVerified: true }),
+    });
+
+    expect(report).toMatchObject({ released: 1, worker_cleanup_attempted: 0 });
+    expect(getDagActorLease({ run_id: "run-reaper", actor_id: "actor-1" })).toMatchObject({
+      state: "dormant",
+      lease_generation: 1,
+    });
+    expect(listDagProvisionedWorkers({ run_id: "run-reaper" })[0]).toMatchObject({
+      worker_id: "worker-disconnected",
+      status: "failed",
+      failure: expect.objectContaining({ reason: "provisioned_worker_disconnected" }),
+    });
+  });
+
+  it("does not release a waiting actor while its provisioned Worker remains connected", async () => {
+    setRunStatus("waiting");
+    acquireWorker("worker-connected");
+    registerConnectedWorker("worker-connected");
+
+    const report = await reapDagActorLeases({ now: now + 2 });
+
+    expect(report.released).toBe(0);
+    expect(getDagActorLease({ run_id: "run-reaper", actor_id: "actor-1" })).toMatchObject({
+      state: "leased",
+      target_id: "worker-connected",
+    });
+    expect(listDagProvisionedWorkers({ run_id: "run-reaper" })[0]).toMatchObject({
+      worker_id: "worker-connected",
+      status: "active",
+    });
+  });
+
+  it("reports an active node whose provisioned Worker disconnects before a terminal response", async () => {
+    setRunStatus("active");
+    const metadata = loadRunMetadata("run-reaper")!;
+    writeRunMetadata("run-reaper", {
+      ...metadata,
+      nodeStates: { ...metadata.nodeStates, "node-1": "RUNNING" },
+    });
+    acquireWorker("worker-active-disconnected");
+    const disconnected: Array<Record<string, string>> = [];
+
+    const report = await reapDagActorLeases({
+      now: now + 2,
+      onActiveWorkerDisconnected: (input) => disconnected.push(input),
+      deprovisionFn: async () => ({ stopped: true, removed: true, dockerCleanupVerified: true }),
+    });
+
+    expect(report).toMatchObject({ released: 1, worker_cleanup_attempted: 0 });
+    expect(disconnected).toEqual([expect.objectContaining({
+      runId: "run-reaper",
+      nodeId: "node-1",
+      actorId: "actor-1",
+      workerId: "worker-active-disconnected",
+      reason: "provisioned_worker_disconnected",
+    })]);
+    expect(getDagActorLease({ run_id: "run-reaper", actor_id: "actor-1" })).toMatchObject({
+      state: "dormant",
+      lease_generation: 1,
+    });
+    expect(listDagProvisionedWorkers({ run_id: "run-reaper" })[0]).toMatchObject({
+      worker_id: "worker-active-disconnected",
+      status: "failed",
+      failure: expect.objectContaining({ reason: "provisioned_worker_disconnected" }),
+    });
+  });
+
+  it("reclaims an active provisioned worker detached from the current lease generation", async () => {
+    acquireWorker("worker-1");
+    acquireWorker("worker-2");
+    registerConnectedWorker("worker-2");
+    const removed: string[] = [];
+
+    const report = await reapDagActorLeases({
+      now: now + 2,
+      deprovisionFn: async (_dockerNodeId, containerId) => {
+        removed.push(containerId);
+        return { stopped: true, removed: true, dockerCleanupVerified: true };
+      },
+    });
+
+    expect(report).toMatchObject({ worker_cleanup_attempted: 1, worker_cleanup_failed: 0 });
+    expect(removed).toEqual(["container-worker-1"]);
+    expect(listDagProvisionedWorkers({ run_id: "run-reaper" })).toEqual([
+      expect.objectContaining({ worker_id: "worker-1", status: "released" }),
+      expect.objectContaining({ worker_id: "worker-2", status: "active" }),
+    ]);
+  });
+
+  it("reclaims an active provisioned worker left behind after terminal lease retirement", async () => {
+    setRunStatus("completed");
+    const lease = acquireWorker();
+    retireDagActorLease({
+      run_id: "run-reaper",
+      actor_id: "actor-1",
+      lease_generation: lease.lease_generation,
+      target_type: lease.target_type!,
+      target_id: lease.target_id!,
+      expected_version: lease.version,
+      now: now + 1,
+    });
+
+    const report = await reapDagActorLeases({
+      now: now + 2,
+      deprovisionFn: async () => ({ stopped: true, removed: true, dockerCleanupVerified: true }),
+    });
+
+    expect(report).toMatchObject({ worker_cleanup_attempted: 1, worker_cleanup_failed: 0 });
+    expect(listDagProvisionedWorkers({ run_id: "run-reaper" })[0]).toMatchObject({ status: "released" });
+  });
+
+  it("respects explicit pins while a waiting actor is otherwise idle-expired", async () => {
+    acquireWorker();
+    setRunStatus("waiting");
+    const leased = getDagActorLease({ run_id: "run-reaper", actor_id: "actor-1" })!;
+    setDagActorLeasePinned({
+      run_id: "run-reaper",
+      actor_id: "actor-1",
+      pinned: true,
+      expected_version: leased.version,
+      now: now + 1,
+    });
+    expect((await reapDagActorLeases({ now: now + 10 })).released).toBe(0);
+    expect(getDagActorLease({ run_id: "run-reaper", actor_id: "actor-1" })?.state).toBe("leased");
+  });
+
+  it("deletes only terminal, retention-expired dormant runtime and checkpoints", async () => {
+    setRunStatus("active");
+    const lease = acquireDagActorLease({
+      run_id: "run-reaper",
+      actor_id: "actor-1",
+      target_type: "worker",
+      target_id: "worker-1",
+      idle_ttl_ms: 100,
+      retention_ttl_ms: 10,
+      now,
+    });
+    writeDagActorCheckpoint({
+      run_id: "run-reaper",
+      actor_id: "actor-1",
+      now: now + 1,
+      checkpoint: {
+        schema_version: 1,
+        objective: "Retain this actor until the terminal retention window expires",
+        confirmed_conclusions: [],
+        unresolved_items: [],
+        key_event_refs: [],
+        artifact_refs: [],
+        surface_binding: "surface-1",
+        context_summary: "Checkpoint retained until actor retention expiry.",
+        round_id: "round-1",
+        actor_generation: 1,
+        captured_at: now + 1,
+      },
+    });
+    releaseDagActorLease({
+      run_id: "run-reaper",
+      actor_id: "actor-1",
+      lease_generation: lease.lease_generation,
+      target_type: "worker",
+      target_id: "worker-1",
+      expected_version: lease.version,
+      retention_ttl_ms: 10,
+      now: now + 1,
+    });
+    // Expired retention alone is insufficient while the owning run is active.
+    expect((await reapDagActorLeases({ now: now + 11 })).runtimes_deleted).toBe(0);
+    expect(getLatestDagActorCheckpoint({ run_id: "run-reaper", actor_id: "actor-1" })).toBeDefined();
+
+    setRunStatus("completed");
+    // Once terminal, retention is selected from normalized status/lease
+    // columns and must not parse aggregate metadata on every reaper tick.
+    getDb().prepare("UPDATE dag_runs SET metadata = ? WHERE run_id = ?")
+      .run("{ intentionally invalid terminal metadata", "run-reaper");
+
+    expect((await reapDagActorLeases({ now: now + 11 })).runtimes_deleted).toBe(1);
+    expect(getDagActor("run-reaper", "actor-1")).toBeUndefined();
+    expect(getLatestDagActorCheckpoint({ run_id: "run-reaper", actor_id: "actor-1" })).toBeUndefined();
+  });
+});

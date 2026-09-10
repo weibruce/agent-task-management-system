@@ -1,0 +1,667 @@
+import * as path from "node:path";
+import * as fs from "node:fs";
+import { fileURLToPath } from "node:url";
+import type { GraphExecutor } from "./graph-executor.js";
+import type { DAGAgentConfig, DAGGraphNode, DAGOutputRoute, ParsedDAG } from "./graph.js";
+import { parseWorkflowSourceFile } from "./workflow-spec-v1.js";
+import { assertProviderPolicy } from "./provider-policy.js";
+import { assertNoYamlProviderRuntime } from "./runtime-selection.js";
+import {
+  applyDagRuntimeProfile,
+  getDagRuntimeProfile,
+  getDagWorkflow,
+  parseStoredDagWorkflow,
+  resolveDagRuntimeProfile,
+} from "../persistence/dag-workflows.js";
+import {
+  appendRunNode,
+  cancelActiveRun,
+  cancelAllActiveRuns,
+  checkpointResumeActiveRun,
+  completeActiveRun,
+  deduplicateWaitingActiveRunResume,
+  decideActiveRunApproval,
+  injectActiveRun,
+  interveneActiveRunActor,
+  restoreActiveRun,
+  resumeWaitingActiveRun,
+  type InterveneDagActorRequest,
+  type InterveneDagActorResult,
+  type ResumeWaitingRunRequest,
+} from "../runtime/active-runs.js";
+import type { DagApprovalRecord } from "../persistence/dag-runtime-primitives.js";
+import { loadRunMetadata } from "../persistence/store.js";
+import type { DagRunInputBindingRequest } from "atms-protocol";
+import { resolveDagRunInputBindings } from "../persistence/run-input-artifacts.js";
+import type { InjectResult, CancelAllResult, CheckpointResumeRequest } from "../runtime/active-runs.js";
+import { emit } from "../events/bus.js";
+import {
+  deriveWorkflowConcurrencyPolicy,
+  loadWorkflowConcurrencyPolicy,
+  releaseWorkflowRunReservation,
+  reserveWorkflowRun,
+} from "../persistence/dag-run-admission.js";
+import {
+  sendDagActorLiveCommands,
+  type SendDagActorLiveCommandRequest,
+  type SendDagActorLiveCommandResult,
+} from "../runtime/dag-actor-live-command-runtime.js";
+import { creationRequestDigest, RunCreationConflictError } from "./run-creation-identity.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = process.env.ATMS_REPO_ROOT
+  ? path.resolve(process.env.ATMS_REPO_ROOT)
+  : path.resolve(__dirname, "../../..");
+
+export interface CreateRunRequest {
+  yamlPath?: string;
+  workflowId?: string;
+  profile?: string;
+  runId?: string;
+  prompt?: string;
+  llmSettingId?: string;
+  admissionSource?: string;
+  expectedWorkflowRevision?: number;
+  expectedCanonicalHash?: string;
+  expectedProfileUpdatedAt?: string;
+  inputScope?: string;
+  inputArtifacts?: DagRunInputBindingRequest[];
+}
+
+export interface CreateRunResponse {
+  runId: string;
+  workflowId?: string;
+  workflowName?: string;
+  workflowRevision?: number;
+  canonicalHash?: string;
+  compilerVersion?: string;
+  sourceApiVersion?: string;
+  nodeCount: number;
+  status: string;
+  createdAt: number;
+}
+
+export interface InvokeRunResponse {
+  dispatched: number;
+}
+
+export interface InjectRunResponse {
+  injected: boolean;
+  nodeId: string;
+  mode: string;
+  delivered: boolean;
+  delivery_target_type?: "worker" | "node";
+  delivery_target_id?: string;
+  delivery_gap?: string;
+}
+
+export interface InterveneActorResponse extends InterveneDagActorResult {
+  redispatched: boolean;
+}
+
+export interface ResumeRunResponse {
+  delivery_mode: "round_resume";
+  resumed: true;
+  previous_round_id: string;
+  round_id: string;
+  ordinal: number;
+  actor_ids: string[];
+  node_ids: string[];
+  command_ids: string[];
+  ready_node_ids: string[];
+  dispatched: number;
+  deduplicated?: boolean;
+}
+
+export type SendActorCommandsResponse = ResumeRunResponse | SendDagActorLiveCommandResult;
+
+export interface CheckpointResumeResponse {
+  scheduled: boolean;
+  resumed: boolean;
+  runId: string;
+  nodeId: string;
+  sessionId: string;
+  parentSessionId?: string;
+  attempt: number;
+  entryUuid?: string;
+  keptEntries: number;
+  totalEntries: number;
+  dispatched: boolean;
+  dispatch_state: "dispatched" | "pending";
+  dispatch_count: number;
+}
+
+export interface AppendNodeRequest {
+  nodeId: string;
+  agentId?: string;
+  agent?: DAGAgentConfig;
+  after?: string[];
+  outputs?: Record<string, DAGOutputRoute>;
+  name?: string;
+  description?: string;
+  image?: string;
+  container_group?: string;
+}
+
+export interface AppendNodeResponse {
+  runId: string;
+  nodeId: string;
+  ready: boolean;
+  dispatched: number;
+  nodeCount: number;
+}
+
+export interface ManagerRunCommandRequest {
+  command: string;
+  commandId?: string;
+  source?: string;
+  append?: AppendNodeRequest;
+}
+
+export interface ManagerRunCommandResponse {
+  runId: string;
+  commandId: string;
+  command: string;
+  source: string;
+  result: AppendNodeResponse;
+}
+
+export interface CreateAndRunRequest extends CreateRunRequest {}
+
+export interface CreateAndRunResponse {
+  run_id: string;
+  runId: string;
+  workflowId?: string;
+  workflowName?: string;
+  workflowRevision?: number;
+  canonicalHash?: string;
+  compilerVersion?: string;
+  sourceApiVersion?: string;
+  nodeCount: number;
+  status: string;
+  createdAt: number;
+  dispatched: number;
+}
+
+function _resolveYamlPath(yamlPath: string): string {
+  const resolved = path.resolve(REPO_ROOT, yamlPath);
+  // Prevent path traversal outside repo
+  const relative = path.relative(REPO_ROOT, resolved);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("yamlPath must be within the repository");
+  }
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`YAML file not found: ${yamlPath}`);
+  }
+  return resolved;
+}
+
+function _generateRunId(): string {
+  return Array.from({ length: 24 }, () =>
+    Math.floor(Math.random() * 16).toString(16),
+  ).join("");
+}
+
+function _applyProfile(
+  parsed: ParsedDAG,
+  profileName: string,
+): ParsedDAG {
+  const profiles = parsed.meta.runtime_profiles ?? {};
+  const profile = profiles[profileName];
+  if (!profile) {
+    throw new Error(`Profile '${profileName}' not found in YAML`);
+  }
+
+  const agents = parsed.meta.agents
+    ? { ...parsed.meta.agents }
+    : {};
+
+  const wildcard = profile.agents?.["*"];
+  if (wildcard) {
+    for (const agentId of Object.keys(agents)) {
+      agents[agentId] = {
+        ...agents[agentId],
+        agent_type: wildcard.agent_type ?? agents[agentId]?.agent_type,
+      };
+    }
+  }
+
+  // Also apply specific agent mappings if present
+  if (profile.agents) {
+    for (const [agentId, mapping] of Object.entries(profile.agents)) {
+      if (agentId === "*") continue;
+      if (agents[agentId]) {
+        agents[agentId] = {
+          ...agents[agentId],
+          agent_type: mapping.agent_type ?? agents[agentId]?.agent_type,
+        };
+      }
+    }
+  }
+
+  return {
+    meta: { ...parsed.meta, agents },
+    graph: parsed.graph,
+    loop_sources: parsed.loop_sources,
+  };
+}
+
+function _applyRunRuntimeSelection(parsed: ParsedDAG, llmSettingId: string | undefined): ParsedDAG {
+  if (!llmSettingId) return parsed;
+  const agentIds = new Set([
+    ...Object.keys(parsed.meta.agents ?? {}),
+    ...parsed.graph.nodes
+      .map((node) => node.agent)
+      .filter((agentId) => agentId && agentId !== "__gateway__"),
+  ]);
+  const agents = Object.fromEntries(
+    Array.from(agentIds).map((agentId) => [
+      agentId,
+      { ...(parsed.meta.agents?.[agentId] ?? {}), llm_setting_id: llmSettingId },
+    ]),
+  );
+  return {
+    meta: { ...parsed.meta, agents },
+    graph: parsed.graph,
+    loop_sources: parsed.loop_sources,
+  };
+}
+
+function _loadDagForRequest(request: CreateRunRequest): ParsedDAG {
+  const workflowId = request.workflowId?.trim();
+  if (workflowId) {
+    const workflow = getDagWorkflow(workflowId);
+    if (!workflow) {
+      throw new Error(`DAG workflow not found in database: ${workflowId}. Run atms dag sync first.`);
+    }
+    if (request.expectedWorkflowRevision !== undefined && workflow.head_revision !== request.expectedWorkflowRevision) {
+      throw new Error(`DAG workflow revision conflict: expected ${request.expectedWorkflowRevision}, got ${workflow.head_revision}`);
+    }
+    if (request.expectedCanonicalHash && workflow.canonical_hash !== request.expectedCanonicalHash) {
+      throw new Error("DAG workflow canonical hash conflict");
+    }
+    return parseStoredDagWorkflow(workflow);
+  }
+  if (!request.yamlPath) {
+    throw new Error("Missing required field: yamlPath or workflow_id");
+  }
+  const resolvedPath = _resolveYamlPath(request.yamlPath);
+  return parseWorkflowSourceFile(resolvedPath);
+}
+
+function _applyRuntimeProfile(parsed: ParsedDAG, request: CreateRunRequest): ParsedDAG {
+  const profileName = request.profile?.trim();
+  if (!profileName) {
+    if (request.expectedProfileUpdatedAt) {
+      throw new Error("DAG runtime profile version requires a database-backed profile");
+    }
+    return parsed;
+  }
+  const workflowId = request.workflowId?.trim() || parsed.meta.workflow_id;
+  if (workflowId) {
+    const dbProfile = getDagRuntimeProfile(workflowId, profileName);
+    if (dbProfile) {
+      if (request.expectedProfileUpdatedAt && dbProfile.updated_at !== request.expectedProfileUpdatedAt) {
+        throw new Error("DAG runtime profile version conflict");
+      }
+      return applyDagRuntimeProfile(parsed, resolveDagRuntimeProfile(dbProfile));
+    }
+    if (!parsed.meta.runtime_profiles?.[profileName]) {
+      throw new Error(`DAG runtime profile not found in database for workflow '${workflowId}': ${profileName}. Run atms profile sync first.`);
+    }
+  }
+  if (request.expectedProfileUpdatedAt) {
+    throw new Error("DAG runtime profile version requires a database-backed profile");
+  }
+  return _applyProfile(parsed, profileName);
+}
+
+export class ChangeOrchestrator {
+  constructor(private graphExecutor: GraphExecutor) {}
+
+  createRun(request: CreateRunRequest): CreateRunResponse {
+    const digest = creationRequestDigest(request);
+
+    if (request.runId) {
+      const existing = loadRunMetadata(request.runId);
+      if (existing) {
+        if (!existing.creationRequestDigest) {
+          throw new RunCreationConflictError(request.runId, "legacy_run");
+        }
+        if (existing.creationRequestDigest !== digest) {
+          throw new RunCreationConflictError(request.runId, "request_mismatch");
+        }
+        return {
+          runId: existing.runId,
+          workflowId: existing.workflowId,
+          workflowName: existing.workflowName,
+          workflowRevision: existing.workflowRevision,
+          canonicalHash: existing.canonicalHash,
+          compilerVersion: existing.compilerVersion,
+          sourceApiVersion: existing.sourceApiVersion,
+          nodeCount: existing.nodeCount ?? Object.keys(existing.nodeStates).length,
+          status: existing.status,
+          createdAt: existing.createdAt,
+        };
+      }
+    }
+
+    const parsed = _loadDagForRequest(request);
+    assertNoYamlProviderRuntime(parsed);
+    const dagWithProfile = _applyRuntimeProfile(parsed, request);
+    const dagWithRuntime = _applyRunRuntimeSelection(dagWithProfile, request.llmSettingId);
+    assertProviderPolicy(dagWithRuntime);
+
+    const runId = request.runId ?? _generateRunId();
+    const requestedInputArtifacts = request.inputArtifacts ?? [];
+    const inputScope = request.inputScope?.trim();
+    let inputArtifacts: ReturnType<typeof resolveDagRunInputBindings> | undefined;
+    if (requestedInputArtifacts.length > 0) {
+      if (!inputScope) throw new Error("input_scope is required when input_artifacts are bound");
+      inputArtifacts = resolveDagRunInputBindings(inputScope, requestedInputArtifacts);
+    }
+    const workflowId = dagWithRuntime.meta.workflow_id?.trim();
+    const reservation = workflowId
+      ? reserveWorkflowRun({
+          runId,
+          workflowId,
+          source: request.admissionSource?.trim() || "manual",
+          policy: deriveWorkflowConcurrencyPolicy(dagWithRuntime.meta.triggers),
+        })
+      : { reserved: false };
+    const run = (() => {
+      try {
+        return this.graphExecutor.createRun(runId, dagWithRuntime, request.prompt, inputArtifacts, digest);
+      } finally {
+        if (reservation.reserved) {
+          try {
+            releaseWorkflowRunReservation(runId);
+          } catch {
+            // Persisted runs supersede this row; failed creations leave only a TTL-bounded orphan.
+          }
+        }
+      }
+    })();
+
+    return {
+      runId: run.runId,
+      workflowId: run.workflowId,
+      workflowName: run.workflowName,
+      workflowRevision: run.workflowRevision,
+      canonicalHash: run.canonicalHash,
+      compilerVersion: run.compilerVersion,
+      sourceApiVersion: run.sourceApiVersion,
+      nodeCount: run.nodeCount ?? dagWithRuntime.graph.nodes.length,
+      status: run.status,
+      createdAt: run.createdAt,
+    };
+  }
+
+  invokeRun(runId: string): InvokeRunResponse {
+    const run = this.graphExecutor.getRun(runId);
+    if (!run) {
+      throw new Error(`Run not found: ${runId}`);
+    }
+    const dispatched = this.graphExecutor.tick(runId);
+    return { dispatched };
+  }
+
+  createAndRun(request: CreateAndRunRequest): CreateAndRunResponse {
+    const createResult = this.createRun(request);
+    // Cold-start lazy restore: if createRun replayed an active status from
+    // persisted metadata but the run is not in this process's memory, restore
+    // it via the supported recovery primitive before attempting to invoke.
+    let effectiveStatus = createResult.status;
+    if (effectiveStatus === "active" && !this.graphExecutor.getRun(createResult.runId)) {
+      const metadata = loadRunMetadata(createResult.runId);
+      if (!metadata) {
+        throw new Error(`Run metadata missing for active run ${createResult.runId}`);
+      }
+      const restoreResult = restoreActiveRun(metadata);
+      if (restoreResult.status === "skipped" && !this.graphExecutor.getRun(createResult.runId)) {
+        throw new Error(
+          `Cannot resume run ${createResult.runId}: restore skipped (${restoreResult.reason})`,
+        );
+      }
+      if (restoreResult.status === "restored") {
+        const actualStatus = restoreResult.run.status;
+        if (actualStatus !== "active") {
+          effectiveStatus = actualStatus as typeof effectiveStatus;
+        }
+      }
+    }
+    const dispatched = effectiveStatus === "active"
+      ? this.invokeRun(createResult.runId).dispatched
+      : 0;
+    return {
+      run_id: createResult.runId,
+      runId: createResult.runId,
+      workflowId: createResult.workflowId,
+      workflowName: createResult.workflowName,
+      workflowRevision: createResult.workflowRevision,
+      canonicalHash: createResult.canonicalHash,
+      compilerVersion: createResult.compilerVersion,
+      sourceApiVersion: createResult.sourceApiVersion,
+      nodeCount: createResult.nodeCount,
+      status: effectiveStatus,
+      createdAt: createResult.createdAt,
+      dispatched,
+    };
+  }
+
+  cancelRun(runId: string): boolean {
+    const run = this.graphExecutor.getRun(runId);
+    if (!run) {
+      throw new Error(`Run not found: ${runId}`);
+    }
+    cancelActiveRun(runId);
+    return true;
+  }
+
+  completeRun(runId: string, expectedRoundId: string): boolean {
+    const run = this.graphExecutor.getRun(runId);
+    if (!run) throw new Error(`Run not found: ${runId}`);
+    if (run.status !== "waiting") throw new Error(`Run ${runId} is not waiting for explicit completion`);
+    if (!expectedRoundId.trim() || run.currentRound.round_id !== expectedRoundId.trim()) {
+      throw new Error(`Waiting round conflict: current round is ${run.currentRound.round_id}`);
+    }
+    completeActiveRun(runId);
+    return true;
+  }
+
+  resumeRun(runId: string, request: ResumeWaitingRunRequest): ResumeRunResponse {
+    const run = this.graphExecutor.getRun(runId);
+    if (!run) throw new Error(`Run not found: ${runId}`);
+
+    const alreadyResumed = deduplicateWaitingActiveRunResume(runId, request);
+    const resumed = alreadyResumed ?? (() => {
+      const reservationId = `resume:${runId}`;
+      const reservation = run.status === "waiting" && run.workflowId
+        ? reserveWorkflowRun({
+            runId: reservationId,
+            workflowId: run.workflowId,
+            source: "resume:command",
+            policy: loadWorkflowConcurrencyPolicy(run.workflowId),
+          })
+        : { reserved: false };
+      try {
+        return resumeWaitingActiveRun(runId, request);
+      } finally {
+        if (reservation.reserved) releaseWorkflowRunReservation(reservationId);
+      }
+    })();
+    const dispatched = this.graphExecutor.tick(runId);
+    return {
+      delivery_mode: "round_resume",
+      resumed: true,
+      previous_round_id: resumed.previousRoundId,
+      round_id: resumed.roundId,
+      ordinal: resumed.ordinal,
+      actor_ids: resumed.actorIds,
+      node_ids: resumed.nodeIds,
+      command_ids: resumed.commandIds,
+      ready_node_ids: resumed.readyNodeIds,
+      dispatched,
+      ...(resumed.deduplicated ? { deduplicated: true } : {}),
+    };
+  }
+
+  sendActorCommands(
+    runId: string,
+    request: SendDagActorLiveCommandRequest,
+  ): SendActorCommandsResponse {
+    const run = this.graphExecutor.getRun(runId);
+    if (!run) throw new Error(`Run not found: ${runId}`);
+    const expectedRoundId = request.expected_round_id?.trim();
+    if (run.status === "active" && expectedRoundId) {
+      const waitingRetry = {
+        expected_round_id: expectedRoundId,
+        commands: request.commands,
+      };
+      if (deduplicateWaitingActiveRunResume(runId, waitingRetry)) {
+        return this.resumeRun(runId, waitingRetry);
+      }
+    }
+    if (run.status === "waiting") {
+      if (!expectedRoundId) throw new Error("expected_round_id is required while the run is waiting");
+      return this.resumeRun(runId, {
+        expected_round_id: expectedRoundId,
+        commands: request.commands,
+      });
+    }
+    if (run.status === "active") return sendDagActorLiveCommands(runId, request);
+    throw new Error(`Run ${runId} is terminal (${run.status})`);
+  }
+
+  emergencyStopAllRuns(): { stopped: number; run_ids: string[]; active_before: number; active_after: number } {
+    const result: CancelAllResult = cancelAllActiveRuns();
+    return {
+      stopped: result.cancelled.length,
+      run_ids: result.cancelled,
+      active_before: result.activeBefore,
+      active_after: result.activeAfter,
+    };
+  }
+
+  injectRun(runId: string, nodeId: string, instruction: string, mode: string): InjectRunResponse {
+    const run = this.graphExecutor.getRun(runId);
+    if (!run) {
+      throw new Error(`Run not found: ${runId}`);
+    }
+    if (run.status !== "active") {
+      emit("dag:instruction_terminal_no_active_target", {
+        runId,
+        nodeId,
+        instruction,
+        mode,
+        reason: "run is terminal",
+      });
+      throw new Error(`Run is terminal: ${runId}`);
+    }
+    const node = run.dagRun.graph.nodes.find((n) => n.node_id === nodeId);
+    if (!node) {
+      throw new Error(`Node not found in run graph: ${nodeId}`);
+    }
+    const result = injectActiveRun(runId, nodeId, instruction, mode);
+    if (!result) {
+      throw new Error(`Injection failed for run ${runId} node ${nodeId}`);
+    }
+    return {
+      injected: true,
+      nodeId,
+      mode,
+      delivered: result.delivered,
+      delivery_target_type: result.deliveryTargetType,
+      delivery_target_id: result.deliveryTargetId,
+      delivery_gap: result.deliveryGap,
+    };
+  }
+
+  interveneActor(runId: string, request: InterveneDagActorRequest): InterveneActorResponse {
+    const result = interveneActiveRunActor(runId, request);
+    return {
+      ...result,
+      redispatched: this.graphExecutor.tick(runId) > 0,
+    };
+  }
+
+  checkpointResumeNode(runId: string, nodeId: string, request: CheckpointResumeRequest): CheckpointResumeResponse {
+    const run = this.graphExecutor.getRun(runId);
+    if (!run) {
+      throw new Error(`Run is not active in this Manager process: ${runId}; persisted runs are replay-only until a Manager recovery pass is implemented.`);
+    }
+    if (run.status !== "active") {
+      throw new Error(`Run is terminal: ${runId}`);
+    }
+    const node = run.dagRun.graph.nodes.find((n) => n.node_id === nodeId);
+    if (!node) {
+      throw new Error(`Node not found in run graph: ${nodeId}`);
+    }
+    const result = checkpointResumeActiveRun(runId, nodeId, request);
+    if (result.status !== "scheduled") {
+      throw new Error(result.reason);
+    }
+    const dispatched = this.graphExecutor.tick(runId);
+    return {
+      scheduled: true,
+      resumed: true,
+      runId,
+      nodeId,
+      sessionId: result.sessionId,
+      parentSessionId: result.parentSessionId,
+      attempt: result.attempt,
+      entryUuid: result.entryUuid,
+      keptEntries: result.keptEntries,
+      totalEntries: result.totalEntries,
+      dispatched: dispatched > 0,
+      dispatch_state: dispatched > 0 ? "dispatched" : "pending",
+      dispatch_count: dispatched,
+    };
+  }
+
+  decideApproval(runId: string, nodeId: string, request: {
+    decision: "approved" | "rejected";
+    actor: string;
+    proposalHash: string;
+  }): { approval: DagApprovalRecord; dispatched: number } {
+    const approval = decideActiveRunApproval({ runId, nodeId, ...request });
+    return { approval, dispatched: this.graphExecutor.tick(runId) };
+  }
+
+  appendNode(runId: string, request: AppendNodeRequest): AppendNodeResponse {
+    const run = this.graphExecutor.getRun(runId);
+    if (!run) throw new Error(`Run not found: ${runId}`);
+    if (run.status !== "active") throw new Error(`Run is terminal: ${runId}`);
+    if (!/^[A-Za-z0-9._-]+$/.test(request.nodeId)) {
+      throw new Error("nodeId contains unsupported characters");
+    }
+    const agentId = request.agentId ?? `${request.nodeId}-agent`;
+    const node: DAGGraphNode = {
+      node_id: request.nodeId,
+      name: request.name ?? request.nodeId,
+      description: request.description ?? "",
+      node_type: "agent",
+      agent: agentId,
+      after: request.after ?? [],
+      outputs: request.outputs ?? { done: { to: "" } },
+      image: request.image ?? "atms-worker:latest",
+      container_group: request.container_group,
+    };
+    if (!request.agent) {
+      throw new Error("Dynamic node append requires explicit agent configuration");
+    }
+    const agent = request.agent;
+    const result = appendRunNode(runId, { node, agentConfig: agent });
+    if (!result) throw new Error(`Append node failed for run ${runId}`);
+    const dispatched = this.graphExecutor.tick(runId);
+    return { ...result, dispatched };
+  }
+
+  runManagerCommand(runId: string, request: ManagerRunCommandRequest): ManagerRunCommandResponse {
+    const run = this.graphExecutor.getRun(runId);
+    if (!run) throw new Error(`Run not found: ${runId}`);
+    if (run.status !== "active") throw new Error(`Run is terminal: ${runId}`);
+    void request;
+    throw new Error("Worker-sourced run commands are unsupported; express topology changes in the DAG template before run creation.");
+  }
+}

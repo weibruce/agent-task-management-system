@@ -1,0 +1,150 @@
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { Check, FlaskConical, Loader2, ShieldCheck } from 'lucide-vue-next'
+import { useI18n } from 'vue-i18n'
+
+const { t } = useI18n()
+const status = ref<DesktopUpdateStatus | null>(null)
+const bridgeAvailable = ref(false)
+const switching = ref(false)
+const localError = ref('')
+let removeListener: (() => void) | null = null
+
+const channelBusy = computed(() => {
+  if (switching.value) return true
+  return ['checking', 'available', 'downloading', 'downloaded', 'installing'].includes(status.value?.state ?? '')
+})
+
+const statusText = computed(() => {
+  if (!status.value) return ''
+  if (status.value.state === 'downloading' && status.value.downloadProgress) {
+    return t('settings.general.updates.state.downloadingProgress', {
+      percent: Math.round(status.value.downloadProgress.percent),
+    })
+  }
+  return t(`settings.general.updates.state.${status.value.state}`)
+})
+
+function desktopBridge(): AtmsDesktopBridge | null {
+  return typeof window === 'undefined' ? null : window.atmsDesktop ?? null
+}
+
+async function selectChannel(channel: DesktopUpdateChannel): Promise<void> {
+  const bridge = desktopBridge()
+  if (!bridge?.setUpdateChannel || channelBusy.value || status.value?.channel === channel) return
+  switching.value = true
+  localError.value = ''
+  try {
+    status.value = await bridge.setUpdateChannel(channel)
+  } catch (error) {
+    localError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    switching.value = false
+  }
+}
+
+onMounted(() => {
+  const bridge = desktopBridge()
+  bridgeAvailable.value = Boolean(bridge?.updateStatus && bridge?.setUpdateChannel)
+  if (!bridgeAvailable.value || !bridge?.updateStatus) return
+  removeListener = bridge.onUpdateStatus?.((nextStatus) => {
+    status.value = nextStatus
+  }) ?? null
+  void bridge.updateStatus()
+    .then((nextStatus) => {
+      status.value = nextStatus
+    })
+    .catch((error) => {
+      localError.value = error instanceof Error ? error.message : String(error)
+    })
+})
+
+onBeforeUnmount(() => {
+  removeListener?.()
+  removeListener = null
+})
+</script>
+
+<template>
+  <div
+    v-if="bridgeAvailable"
+    class="border-b border-[var(--atms-border)] pb-6"
+    data-testid="desktop-update-settings"
+  >
+    <div class="flex items-start gap-3">
+      <div class="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg border border-[var(--atms-border)] bg-[var(--atms-surface-1)] text-[var(--atms-text-2)]">
+        <Loader2 v-if="switching" class="h-4 w-4 animate-spin" />
+        <FlaskConical v-else class="h-4 w-4" />
+      </div>
+      <div class="min-w-0 flex-1">
+        <div class="text-sm font-medium text-[var(--atms-text-1)]">{{ t('settings.general.updates.title') }}</div>
+        <div class="mt-1 text-sm text-[var(--atms-text-3)]">{{ t('settings.general.updates.description') }}</div>
+
+        <div
+          class="mt-4 grid max-w-2xl gap-3 sm:grid-cols-2"
+          role="radiogroup"
+          :aria-label="t('settings.general.updates.title')"
+        >
+          <button
+            v-for="channel in (['stable', 'early-access'] as DesktopUpdateChannel[])"
+            :key="channel"
+            class="flex min-h-24 items-start gap-3 rounded-xl border px-4 py-3 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+            :class="status?.channel === channel
+              ? 'border-[var(--atms-settings-active-border)] bg-[var(--atms-settings-active)] text-[var(--atms-text-1)]'
+              : 'border-[var(--atms-settings-divider)] bg-[var(--atms-settings-card)] text-[var(--atms-text-2)] hover:border-[var(--atms-border-strong)] hover:bg-[var(--atms-settings-card-hover)]'"
+            :data-testid="`desktop-update-channel-${channel}`"
+            type="button"
+            role="radio"
+            :aria-checked="status?.channel === channel"
+            :disabled="channelBusy"
+            @click="selectChannel(channel)"
+          >
+            <ShieldCheck v-if="channel === 'stable'" class="mt-0.5 h-4 w-4 flex-shrink-0" />
+            <FlaskConical v-else class="mt-0.5 h-4 w-4 flex-shrink-0" />
+            <span class="min-w-0 flex-1">
+              <span class="block text-sm font-semibold">{{ t(`settings.general.updates.channels.${channel}.label`) }}</span>
+              <span class="mt-1 block text-xs leading-5 text-[var(--atms-text-3)]">
+                {{ t(`settings.general.updates.channels.${channel}.description`) }}
+              </span>
+            </span>
+            <Check v-if="status?.channel === channel" class="mt-0.5 h-4 w-4 flex-shrink-0 text-[var(--atms-accent)]" />
+          </button>
+        </div>
+
+        <p v-if="status" class="mt-3 text-xs text-[var(--atms-text-3)]" data-testid="desktop-update-state">
+          {{ t('settings.general.updates.currentVersion', { version: status.currentVersion }) }}
+          · {{ statusText }}
+        </p>
+        <div
+          v-if="status?.state === 'downloading' && status.downloadProgress"
+          class="mt-2 h-1.5 max-w-2xl overflow-hidden rounded-full bg-[var(--atms-surface-2)]"
+          role="progressbar"
+          :aria-label="statusText"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          :aria-valuenow="Math.round(status.downloadProgress.percent)"
+          data-testid="desktop-update-progress"
+        >
+          <div
+            class="h-full rounded-full bg-[var(--atms-accent)] transition-[width]"
+            :style="{ width: `${Math.max(0, Math.min(100, status.downloadProgress.percent))}%` }"
+          />
+        </div>
+        <p
+          v-if="status?.channelNotice === 'waiting-for-newer-stable'"
+          class="mt-2 text-xs leading-5 text-[var(--atms-warning)]"
+          data-testid="desktop-update-channel-notice"
+        >
+          {{ t('settings.general.updates.waitingForStable') }}
+        </p>
+        <p
+          v-if="localError || status?.error"
+          class="mt-2 break-words text-xs leading-5 text-[var(--atms-danger)]"
+          data-testid="desktop-update-error"
+        >
+          {{ t('settings.general.updates.error', { message: localError || status?.error }) }}
+        </p>
+      </div>
+    </div>
+  </div>
+</template>

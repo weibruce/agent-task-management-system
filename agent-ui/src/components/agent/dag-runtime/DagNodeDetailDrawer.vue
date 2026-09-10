@@ -1,0 +1,534 @@
+<script setup lang="ts">
+/**
+ * DagNodeDetailDrawer — DAG Runtime 覆盖层右侧浮出的节点详情抽屉。
+ *
+ * 双面板结构：
+ *  - 任务详情（节点职责 system prompt + 用户任务 inputs.prompt）
+ *  - 聊天日志（气泡式，worker 响应流）
+ *
+ * 手柄：■(square) 展开/折叠当前聚焦面板，dpad↑↓ 切面板焦点。
+ * 聊天日志面板展开时自动滚到底部（最新记录）。
+ */
+
+import { computed, ref, watch, nextTick } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { useAgentStore } from '@/stores/agent-store'
+import { useDagNodeMessages } from '@/composables/useDagNodeMessages'
+import { useDagNodeResult } from '@/components/agent/dag-node-result/useDagNodeResult'
+import DagNodeResultView from '@/components/agent/dag-node-result/DagNodeResultView.vue'
+import { getAgentPersona, fmtTokens, contextBarColor, contextUsageText } from '@/lib/agentPersonas'
+import { cn } from '@/lib/utils'
+import { http } from '@/api/clients/http-client'
+import { renderMarkdown } from '@/utils/message-formatter'
+import { formatRepositoryReferencesForDisplay } from './dagRuntimePresentation'
+import { resolveDagRuntimeNodeSemantic } from './dagRuntimeNodeSemantics'
+import MessageList from '@/components/message/MessageList.vue'
+import type { DAGRunMetrics } from '@/api/types/dag.types'
+import { X, ChevronDown, ChevronUp, FileText, MessageSquare, Wrench, AlertTriangle, Coins, Clock, Workflow } from 'lucide-vue-next'
+
+type PanelKey = 'task' | 'logs'
+
+const props = defineProps<{
+  metrics: DAGRunMetrics | null
+  selectedNodeId: string | null
+  open: boolean
+  /** 当前聚焦的面板（手柄 dpad↑↓ 切换） */
+  panelFocus: PanelKey
+  /** 展开的面板集合（■ 切换） */
+  expandedPanels: Set<PanelKey>
+}>()
+
+const emit = defineEmits<{
+  close: []
+  'toggle-panel': [panel: PanelKey]
+}>()
+
+const store = useAgentStore()
+const { t } = useI18n()
+const dagRunId = computed(() => store.currentRunId ?? undefined)
+const isSelectedManager = computed(() => store.selectedNodeIsManager)
+
+const { messages, loading } = useDagNodeMessages(
+  dagRunId,
+  computed(() => props.selectedNodeId),
+  isSelectedManager,
+)
+
+// 非 worker 节点（command/join/condition 等 Manager 逻辑节点）的结构化结果
+const selectedNodeIdRef = computed(() => props.selectedNodeId)
+const { result: nodeResult, loading: resultLoading } = useDagNodeResult(dagRunId, selectedNodeIdRef)
+
+const logScrollRef = ref<HTMLElement | null>(null)
+const taskScrollRef = ref<HTMLElement | null>(null)
+
+const node = computed(() => {
+  if (!props.selectedNodeId) return null
+  return store.nodes.find(n => n.id === props.selectedNodeId) ?? null
+})
+
+const nodeMetrics = computed(() => {
+  if (!props.selectedNodeId || !props.metrics) return null
+  return props.metrics.nodes[props.selectedNodeId] ?? null
+})
+
+const execution = computed(() => nodeMetrics.value?.execution ?? null)
+
+const modelDisplayName = computed(() => (
+  execution.value?.model_display_name
+  || execution.value?.model_name
+  || t('dag.detail.unknown')
+))
+
+const exactModelName = computed(() => {
+  const exact = execution.value?.model_name
+  if (!exact || exact === execution.value?.model_display_name) return null
+  return exact
+})
+
+const providerDisplayName = computed(() => (
+  execution.value?.provider_display_name
+  || execution.value?.provider_id
+  || t('dag.detail.unknown')
+))
+
+const persona = computed(() => {
+  return node.value ? getAgentPersona(node.value.agent_name) : null
+})
+
+const nodeSemantic = computed(() => resolveDagRuntimeNodeSemantic(
+  node.value?.node_type,
+  node.value?.gateway_config,
+))
+
+const nodeHeading = computed(() => (
+  nodeSemantic.value.isWorker ? persona.value?.name : node.value?.name
+))
+
+const nodeSubtitle = computed(() => (
+  nodeSemantic.value.isWorker
+    ? `${t('dag.nodeTypes.worker')} · ${node.value?.name ?? ''}`
+    : `${t('dag.nodeTypes.managerLogic')} · ${nodeSemantic.value.label}`
+))
+
+// 任务详情：从原始 chat entries 提取 manager 发的 prompt（inputs + system）
+const taskPrompt = ref<string>('')
+const taskSystem = ref<string>('')
+
+async function fetchTaskDetail(runId: string, nodeId: string): Promise<void> {
+  try {
+    const res = await http.get<any>(`/api/dag-status/${runId}/node/${nodeId}/chat`)
+    const entries = res.data?.messages || []
+    const promptEntry = entries.find((e: any) => e?.role === 'manager' && e?.type === 'prompt')
+    if (promptEntry?.content) {
+      const c = promptEntry.content
+      // inputs.prompt 是用户任务（数组），agentConfig.system 是节点职责
+      const inputs = c.inputs ?? {}
+      const promptArr = inputs.prompt
+      const prompt = Array.isArray(promptArr)
+        ? promptArr.map(String).join('\n')
+        : (typeof promptArr === 'string' ? promptArr : '')
+      taskPrompt.value = formatRepositoryReferencesForDisplay(prompt)
+      taskSystem.value = typeof c.agentConfig?.system === 'string'
+        ? formatRepositoryReferencesForDisplay(c.agentConfig.system)
+        : ''
+    } else {
+      taskPrompt.value = ''
+      taskSystem.value = ''
+    }
+  } catch {
+    taskPrompt.value = ''
+    taskSystem.value = ''
+  }
+}
+
+// 节点切换时重新拉取任务详情
+watch(
+  () => [props.selectedNodeId, dagRunId.value] as const,
+  ([nid, rid]) => {
+    if (nid && rid) void fetchTaskDetail(rid, nid)
+  },
+  { immediate: true },
+)
+
+function statusLabel(status: string): string {
+  const map: Record<string, string> = {
+    pending: t('dag.status.pending'), ready: t('dag.status.ready'), running: t('dag.status.running'),
+    waiting_for_command: t('dag.status.waitingForCommand'),
+    completed: t('dag.status.completed'), failed: t('dag.status.failed'), cancelled: t('dag.status.cancelled'), skipped: t('dag.status.skipped'),
+  }
+  return map[status] ?? status
+}
+
+function statusClass(status: string): string {
+  switch (status) {
+    case 'running': return 'border-[var(--atms-success-border)] bg-[var(--atms-success-soft)] text-[var(--atms-success)]'
+    case 'waiting_for_command': return 'border-[var(--atms-warning-border)] bg-[var(--atms-warning-soft)] text-[var(--atms-warning)]'
+    case 'completed': return 'border-[var(--atms-info-border)] bg-[var(--atms-info-soft)] text-[var(--atms-info)]'
+    case 'failed': return 'border-[var(--atms-danger-border)] bg-[var(--atms-danger-soft)] text-[var(--atms-danger)]'
+    case 'cancelled': return 'border-[var(--atms-warning-border)] bg-[var(--atms-warning-soft)] text-[var(--atms-warning)]'
+    case 'ready': return 'border-[var(--atms-accent-border)] bg-[var(--atms-accent-soft)] text-[var(--atms-accent)]'
+    case 'skipped': return 'border-[var(--atms-warning-border)] bg-[var(--atms-warning-soft)] text-[var(--atms-warning)]'
+    default: return 'border-[var(--atms-border)] bg-[var(--atms-surface-1)] text-[var(--atms-text-3)]'
+  }
+}
+
+function fmtDuration(ms: number | null): string {
+  if (ms == null) return '—'
+  if (ms < 1000) return `${ms}ms`
+  const s = ms / 1000
+  if (s < 60) return `${s.toFixed(1)}s`
+  return `${Math.floor(s / 60)}m${Math.floor(s % 60)}s`
+}
+
+// 日志面板展开时滚到底部（最新记录）
+watch(
+  () => [props.expandedPanels.has('logs'), props.selectedNodeId, messages.value.length] as const,
+  ([logsExpanded]) => {
+    if (!logsExpanded) return
+    void nextTick(() => {
+      const el = logScrollRef.value
+      if (el) el.scrollTop = el.scrollHeight
+    })
+  },
+  { flush: 'post' },
+)
+
+/** 手柄右摇杆滚动（overlay 通过 ref 调用）：跟随当前聚焦的面板 */
+function scrollBy(delta: number): void {
+  // 聚焦哪个面板就滚哪个；若该面板未展开，退而滚日志
+  const target = props.panelFocus === 'task' && props.expandedPanels.has('task')
+    ? taskScrollRef.value
+    : logScrollRef.value
+  if (target) target.scrollBy({ top: delta, behavior: 'auto' })
+}
+
+function isPanelFocused(key: PanelKey): boolean {
+  return props.panelFocus === key
+}
+
+function isPanelExpanded(key: PanelKey): boolean {
+  return props.expandedPanels.has(key)
+}
+
+defineExpose({ scrollBy })
+</script>
+
+<template>
+  <transition name="drawer-slide">
+    <aside
+      v-if="open && node"
+      class="dag-detail-drawer pointer-events-auto absolute bottom-0 right-0 top-[88px] z-30 flex w-[min(94vw,520px)] flex-col border-l-2 border-t border-[var(--atms-border-strong)] bg-[var(--atms-panel)] backdrop-blur-2xl"
+    >
+      <!-- 头部 -->
+      <div class="flex items-center gap-3 border-b-2 border-[var(--atms-border)] px-6 py-4 flex-shrink-0">
+        <div
+          class="flex h-12 w-12 items-center justify-center flex-shrink-0 border"
+          :class="nodeSemantic.isWorker ? 'rounded-full border-[var(--atms-border)]' : 'rounded-xl border-[var(--atms-accent-border)]'"
+          :style="{ backgroundColor: nodeSemantic.isWorker && persona?.color ? `${persona.color}22` : 'var(--atms-accent-soft)' }"
+        >
+          <component
+            :is="nodeSemantic.isWorker ? persona?.icon : Workflow"
+            class="h-5 w-5"
+            :style="{ color: nodeSemantic.isWorker ? (persona?.color ?? 'var(--atms-text-3)') : 'var(--atms-accent)' }"
+          />
+        </div>
+        <div class="min-w-0 flex-1">
+          <div class="text-base font-semibold text-[var(--atms-text-1)] truncate">{{ nodeHeading }}</div>
+          <div data-testid="dag-node-execution-owner" class="text-sm text-[var(--atms-text-3)] truncate">{{ nodeSubtitle }}</div>
+        </div>
+        <span
+          :class="cn('rounded-full border px-3 py-1 text-xs font-medium', statusClass(node.status))"
+        >
+          {{ statusLabel(node.status) }}
+        </span>
+        <button
+          class="rounded-full p-2 text-[var(--atms-text-3)] transition-colors hover:bg-[var(--atms-surface-2)] hover:text-[var(--atms-text-1)]"
+          :title="t('dag.detail.close')"
+          @click="emit('close')"
+        >
+          <X class="h-5 w-5" />
+        </button>
+      </div>
+
+      <!-- 指标条（紧凑） -->
+      <div v-if="nodeMetrics && nodeSemantic.isWorker" class="flex items-center gap-4 px-6 py-2.5 flex-shrink-0 border-b border-[var(--atms-border)] text-sm">
+        <span class="flex items-center gap-1.5">
+          <Wrench class="h-3.5 w-3.5 text-[var(--atms-info)]" />
+          <span class="font-mono font-semibold text-[var(--atms-text-1)]">{{ nodeMetrics.tool_calls }}</span>
+        </span>
+        <span v-if="nodeMetrics.tool_failures > 0" class="flex items-center gap-1.5">
+          <AlertTriangle class="h-3.5 w-3.5 text-[var(--atms-danger)]" />
+          <span class="font-mono font-semibold text-[var(--atms-danger)]">{{ nodeMetrics.tool_failures }}</span>
+        </span>
+        <span class="flex items-center gap-1.5">
+          <Clock class="h-3.5 w-3.5 text-[var(--atms-text-3)]" />
+          <span class="font-mono text-[var(--atms-text-2)]">{{ fmtDuration(nodeMetrics.duration_ms) }}</span>
+        </span>
+      </div>
+      <section
+        v-if="nodeSemantic.isWorker"
+        data-testid="dag-node-execution"
+        class="flex-shrink-0 border-b border-[var(--atms-border)] bg-[var(--atms-surface-1)] px-6 py-4"
+      >
+        <div class="flex items-center justify-between gap-3">
+          <div class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-[var(--atms-text-3)]">
+            <Coins class="h-3.5 w-3.5 text-[var(--atms-success)]" />
+            {{ t('dag.detail.execution') }}
+          </div>
+          <span class="text-[10px] text-[var(--atms-text-4)]">{{ t('dag.detail.nodeCumulative') }}</span>
+        </div>
+
+        <div class="mt-3 grid grid-cols-2 gap-x-5 gap-y-3">
+          <div class="min-w-0">
+            <div class="text-[10px] uppercase tracking-wide text-[var(--atms-text-4)]">{{ t('dag.detail.model') }}</div>
+            <div data-testid="dag-execution-model" class="mt-0.5 truncate text-sm font-medium text-[var(--atms-text-1)]">
+              {{ modelDisplayName }}
+            </div>
+            <div v-if="exactModelName" class="truncate font-mono text-[10px] text-[var(--atms-text-4)]">{{ exactModelName }}</div>
+          </div>
+          <div class="min-w-0">
+            <div class="text-[10px] uppercase tracking-wide text-[var(--atms-text-4)]">{{ t('dag.detail.provider') }}</div>
+            <div data-testid="dag-execution-provider" class="mt-0.5 truncate text-sm text-[var(--atms-text-2)]">{{ providerDisplayName }}</div>
+          </div>
+          <div class="min-w-0">
+            <div class="text-[10px] uppercase tracking-wide text-[var(--atms-text-4)]">{{ t('dag.detail.backend') }}</div>
+            <div data-testid="dag-execution-backend" class="mt-0.5 truncate font-mono text-xs text-[var(--atms-text-2)]">
+              {{ execution?.agent_backend || t('dag.detail.unknown') }}
+            </div>
+          </div>
+          <div class="min-w-0">
+            <div class="text-[10px] uppercase tracking-wide text-[var(--atms-text-4)]">{{ t('dag.detail.protocol') }}</div>
+            <div data-testid="dag-execution-protocol" class="mt-0.5 truncate font-mono text-xs text-[var(--atms-text-2)]">
+              {{ execution?.protocol || t('dag.detail.unknown') }}
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-4">
+          <div class="mb-2 text-[10px] uppercase tracking-wide text-[var(--atms-text-4)]">{{ t('dag.detail.tokenUsage') }}</div>
+          <div class="grid grid-cols-5 gap-1.5">
+            <div class="rounded-lg border border-[var(--atms-border)] bg-[var(--atms-panel)] px-2 py-2">
+              <div class="text-[9px] text-[var(--atms-text-4)]">{{ t('dag.detail.inputTokens') }}</div>
+              <div class="mt-0.5 font-mono text-xs text-[var(--atms-text-1)]">{{ nodeMetrics?.tokens ? fmtTokens(nodeMetrics.tokens.input) : t('dag.detail.unknown') }}</div>
+            </div>
+            <div class="rounded-lg border border-[var(--atms-border)] bg-[var(--atms-panel)] px-2 py-2">
+              <div class="text-[9px] text-[var(--atms-text-4)]">{{ t('dag.detail.outputTokens') }}</div>
+              <div class="mt-0.5 font-mono text-xs text-[var(--atms-text-1)]">{{ nodeMetrics?.tokens ? fmtTokens(nodeMetrics.tokens.output) : t('dag.detail.unknown') }}</div>
+            </div>
+            <div class="rounded-lg border border-[var(--atms-border)] bg-[var(--atms-panel)] px-2 py-2">
+              <div class="text-[9px] text-[var(--atms-text-4)]">{{ t('dag.detail.cacheReadTokens') }}</div>
+              <div class="mt-0.5 font-mono text-xs text-[var(--atms-text-1)]">{{ nodeMetrics?.tokens ? fmtTokens(nodeMetrics.tokens.cache_read) : t('dag.detail.unknown') }}</div>
+            </div>
+            <div class="rounded-lg border border-[var(--atms-border)] bg-[var(--atms-panel)] px-2 py-2">
+              <div class="text-[9px] text-[var(--atms-text-4)]">{{ t('dag.detail.cacheCreationTokens') }}</div>
+              <div class="mt-0.5 font-mono text-xs text-[var(--atms-text-1)]">{{ nodeMetrics?.tokens ? fmtTokens(nodeMetrics.tokens.cache_creation) : t('dag.detail.unknown') }}</div>
+            </div>
+            <div
+              class="rounded-lg border border-[var(--atms-success-border)] bg-[var(--atms-success-soft)] px-2 py-2"
+              :title="t('dag.detail.totalTokensHint')"
+            >
+              <div class="text-[9px] text-[var(--atms-success)]">{{ t('dag.detail.totalTokens') }}</div>
+              <div data-testid="dag-execution-total-tokens" class="mt-0.5 font-mono text-xs font-semibold text-[var(--atms-success)]">
+                {{ nodeMetrics?.tokens ? fmtTokens(nodeMetrics.tokens.total) : t('dag.detail.unknown') }}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-3 flex items-center gap-2 text-[10px] text-[var(--atms-text-4)]">
+          <span>{{ t('dag.detail.context') }}</span>
+          <span class="font-mono text-[var(--atms-text-2)]">
+            <template v-if="execution?.context_usage_pct != null">{{ execution.context_usage_pct.toFixed(1) }}%</template>
+            <template v-else>{{ t('dag.detail.unknown') }}</template>
+            <template v-if="execution?.context_limit != null"> · {{ fmtTokens(execution.context_limit) }}</template>
+          </span>
+        </div>
+      </section>
+      <div
+        v-else-if="!nodeSemantic.isWorker"
+        class="flex items-center gap-2 border-b border-[var(--atms-border)] bg-[var(--atms-accent-soft)] px-6 py-2.5 text-xs text-[var(--atms-text-2)]"
+      >
+        <Workflow class="h-3.5 w-3.5 text-[var(--atms-accent)]" />
+        {{ t('dag.detail.managerExecuted') }}
+      </div>
+
+      <!-- 非 worker 节点：结构化结果（command/join/condition 等，替代纯文字横幅） -->
+      <section
+        v-if="!nodeSemantic.isWorker"
+        data-testid="dag-node-result"
+        class="flex-shrink-0 border-b border-[var(--atms-border)]"
+      >
+        <div class="flex items-center gap-2 px-6 pt-3 text-xs font-semibold uppercase tracking-wider text-[var(--atms-text-3)]">
+          {{ t('dag.result.title') }}
+        </div>
+        <DagNodeResultView :result="nodeResult" :loading="resultLoading" />
+      </section>
+
+      <!-- 面板：任务详情 -->
+      <button
+        data-testid="dag-detail-task-toggle"
+        :class="cn(
+          'flex items-center gap-2.5 px-6 py-3 text-left transition-colors flex-shrink-0 border-b border-[var(--atms-border)]',
+          isPanelFocused('task') ? 'bg-[var(--atms-accent-soft)]' : 'hover:bg-[var(--atms-surface-1)]'
+        )"
+        @click="emit('toggle-panel', 'task')"
+      >
+        <FileText class="h-4 w-4 flex-shrink-0" :class="isPanelFocused('task') ? 'text-[var(--atms-accent)]' : 'text-[var(--atms-text-3)]'" />
+        <span class="flex-1 text-sm font-medium" :class="isPanelFocused('task') ? 'text-[var(--atms-accent)]' : 'text-[var(--atms-text-2)]'">{{ t('dag.detail.task') }}</span>
+        <span v-if="isPanelExpanded('task')" class="rounded bg-[var(--atms-accent-soft)] px-1.5 py-0.5 text-[10px] text-[var(--atms-accent)]">{{ t('dag.detail.collapse') }}</span>
+        <component :is="isPanelExpanded('task') ? ChevronUp : ChevronDown" class="h-4 w-4 text-[var(--atms-text-3)]" />
+      </button>
+      <div v-if="isPanelExpanded('task')" ref="taskScrollRef" class="dag-task-detail flex-shrink-0 overflow-y-auto border-b border-[var(--atms-border)] px-6 py-4 max-h-[40vh]">
+        <div v-if="taskSystem" class="mb-4">
+          <div class="mb-2 text-xs font-semibold uppercase tracking-wider text-[var(--atms-text-3)]">{{ t('dag.detail.role') }}</div>
+          <div class="agent-markdown text-[15px] leading-relaxed text-[var(--atms-text-2)]" v-html="renderMarkdown(taskSystem)" />
+        </div>
+        <div v-if="taskPrompt">
+          <div class="mb-2 text-xs font-semibold uppercase tracking-wider text-[var(--atms-text-3)]">{{ t('dag.detail.userTask') }}</div>
+          <div class="rounded-xl border border-[var(--atms-border)] bg-[var(--atms-surface-1)] px-5 py-4">
+            <div class="agent-markdown text-[15px] leading-relaxed text-[var(--atms-text-1)]" v-html="renderMarkdown(taskPrompt)" />
+          </div>
+        </div>
+        <div v-if="!taskSystem && !taskPrompt" class="py-6 text-center text-sm text-[var(--atms-text-4)]">
+          {{ t('dag.detail.noTask') }}
+        </div>
+      </div>
+
+      <!-- 面板：聊天日志 -->
+      <button
+        data-testid="dag-detail-logs-toggle"
+        :class="cn(
+          'flex items-center gap-2.5 px-6 py-3 text-left transition-colors flex-shrink-0 border-b border-[var(--atms-border)]',
+          isPanelFocused('logs') ? 'bg-[var(--atms-accent-soft)]' : 'hover:bg-[var(--atms-surface-1)]'
+        )"
+        @click="emit('toggle-panel', 'logs')"
+      >
+        <MessageSquare class="h-4 w-4 flex-shrink-0" :class="isPanelFocused('logs') ? 'text-[var(--atms-accent)]' : 'text-[var(--atms-text-3)]'" />
+        <span class="flex-1 text-sm font-medium" :class="isPanelFocused('logs') ? 'text-[var(--atms-accent)]' : 'text-[var(--atms-text-2)]'">{{ t('dag.detail.logs') }}</span>
+        <span v-if="isPanelExpanded('logs')" class="rounded bg-[var(--atms-accent-soft)] px-1.5 py-0.5 text-[10px] text-[var(--atms-accent)]">{{ t('dag.detail.collapse') }}</span>
+        <component :is="isPanelExpanded('logs') ? ChevronUp : ChevronDown" class="h-4 w-4 text-[var(--atms-text-3)]" />
+      </button>
+      <div v-if="isPanelExpanded('logs')" ref="logScrollRef" class="dag-chat-log min-h-0 flex-1 overflow-y-auto px-4 py-3">
+        <MessageList
+          :messages="messages"
+          :loading="loading"
+          :empty-text="t('dag.detail.noLogs')"
+        />
+      </div>
+
+      <!-- 两个都折叠时填充 -->
+      <div v-if="!isPanelExpanded('task') && !isPanelExpanded('logs')" class="flex-1" />
+    </aside>
+  </transition>
+</template>
+
+<style scoped>
+.dag-detail-drawer {
+  box-shadow: var(--atms-shadow-floating);
+}
+
+.drawer-slide-enter-active,
+.drawer-slide-leave-active {
+  transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1), opacity 200ms ease;
+}
+
+.drawer-slide-enter-from,
+.drawer-slide-leave-to {
+  transform: translateX(100%);
+  opacity: 0;
+}
+
+/* 放大 MessageList 内部字号，强化气泡左右布局 */
+.dag-chat-log :deep(.message-list) {
+  gap: 0.75rem;
+}
+.dag-chat-log :deep(.text-message-item) {
+  font-size: 1rem;
+  line-height: 1.7;
+}
+.dag-chat-log :deep(.text-message-item .text-content) {
+  font-size: 1rem;
+}
+.dag-chat-log :deep(.user-message) {
+  background: var(--atms-accent-soft);
+  border: 1px solid var(--atms-accent-border);
+  border-radius: 16px 16px 16px 4px;
+  padding: 12px 16px;
+  max-width: 92%;
+  align-self: flex-start;
+}
+.dag-chat-log :deep(.text-message-item:not(.user-message):not(.thinking-message) .text-content) {
+  background: var(--atms-surface-1);
+  border: 1px solid var(--atms-border);
+  border-radius: 16px 16px 4px 16px;
+  padding: 12px 16px;
+  margin-left: auto;
+  max-width: 92%;
+  display: block;
+}
+.dag-chat-log :deep(.thinking-message .thinking-header) {
+  font-size: 0.875rem;
+}
+.dag-chat-log :deep(.thinking-content) {
+  font-size: 0.9rem;
+}
+.dag-chat-log :deep(.tool-message-item) {
+  font-size: 0.95rem;
+}
+.dag-chat-log :deep(.tool-message-item .tool-name) {
+  font-size: 1rem;
+}
+
+/* 任务详情 markdown 渲染样式（agent-markdown 复用全局类名，字号放大） */
+.dag-task-detail .agent-markdown {
+  word-break: break-word;
+}
+.dag-task-detail .agent-markdown :deep(h1),
+.dag-task-detail .agent-markdown :deep(h2),
+.dag-task-detail .agent-markdown :deep(h3) {
+  font-weight: 600;
+  margin: 0.6em 0 0.3em;
+  color: var(--atms-text-1);
+}
+.dag-task-detail .agent-markdown :deep(h1) { font-size: 1.15rem; }
+.dag-task-detail .agent-markdown :deep(h2) { font-size: 1.05rem; }
+.dag-task-detail .agent-markdown :deep(h3) { font-size: 1rem; }
+.dag-task-detail .agent-markdown :deep(p) {
+  margin: 0.4em 0;
+}
+.dag-task-detail .agent-markdown :deep(ul),
+.dag-task-detail .agent-markdown :deep(ol) {
+  margin: 0.4em 0;
+  padding-left: 1.4em;
+}
+.dag-task-detail .agent-markdown :deep(li) {
+  margin: 0.2em 0;
+}
+.dag-task-detail .agent-markdown :deep(code) {
+  background: var(--atms-accent-soft);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+  font-size: 0.9em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.dag-task-detail .agent-markdown :deep(pre) {
+  background: var(--atms-code-bg);
+  border: 1px solid var(--atms-border);
+  border-radius: 8px;
+  padding: 0.75em 1em;
+  overflow-x: auto;
+  margin: 0.5em 0;
+}
+.dag-task-detail .agent-markdown :deep(pre code) {
+  background: none;
+  padding: 0;
+}
+.dag-task-detail .agent-markdown :deep(strong) {
+  color: var(--atms-text-1);
+  font-weight: 600;
+}
+.dag-task-detail .agent-markdown :deep(a) {
+  color: var(--atms-accent);
+  text-decoration: underline;
+}
+</style>
