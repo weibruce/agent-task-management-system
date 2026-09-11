@@ -89,7 +89,14 @@ export async function managerChat(data: unknown, signal?: AbortSignal): Promise<
       ...request,
       ...currentBrowserToolsTurnBinding(),
     },
-    signal ? { signal } : undefined,
+    {
+      // Manager Agent turns can run long (DAG planning, multi-step tool
+      // calls). Match the Manager-side AbortSignal.timeout(1_800_000) so the
+      // UI does not give up after the 300s axios default and show
+      // "这次没能完成" while the turn is still running server-side.
+      timeout: 1_800_000,
+      ...(signal ? { signal } : {}),
+    },
   )
 }
 
