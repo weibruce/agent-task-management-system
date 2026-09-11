@@ -22,6 +22,7 @@ import {
 } from "../persistence/agent-sessions.js";
 import { loadRunMetadata } from "../persistence/store.js";
 import { getActiveRun } from "../runtime/active-runs.js";
+import { ingestSessionMessages } from "../rag/session-ingest.js";
 
 // ---------------------------------------------------------------------------
 // Response helpers (same pattern as mutations.ts)
@@ -162,6 +163,9 @@ export function agentSessionRoutesHandler(
       _notFound(res, `Session not found: ${sessionId}`);
       return true;
     }
+    // Best-effort long-term memory ingestion: fire-and-forget, bounded by a
+    // hard timeout inside ingestSessionMessages. Never blocks the response.
+    void ingestSessionMessages(sessionId);
     _ok(res, "Manager session closed", session);
     return true;
   }

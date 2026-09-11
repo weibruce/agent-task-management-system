@@ -78,6 +78,7 @@ const CLEARABLE_TABLES = new Set([
   "voice_artifacts",
   "generative_ui_user_overrides",
   "generative_ui_transactions",
+  "memory_chunks",
   "generative_ui_documents",
   "plugin_activation_events",
   "plugin_action_events",
@@ -2761,6 +2762,23 @@ function validatePluginAgentToolContinuationSchemaV14(db: SqliteDatabase): void 
   ))) throw new Error("Schema migration 14 is incomplete: Agent Tool continuation retention constraint is missing");
 }
 
+function validateMemoryRagSchemaV38(db: SqliteDatabase): void {
+  if (!hasTable(db, "memory_chunks") || !hasTable(db, "memory_rag_config")) {
+    throw new Error("Schema migration 38 is incomplete: missing memory RAG tables");
+  }
+  for (const column of ["id", "scope", "scope_key", "content", "content_hash", "embedding", "dim"]) {
+    if (!hasColumn(db, "memory_chunks", column)) {
+      throw new Error(`Schema migration 38 is incomplete: memory_chunks is missing column ${column}`);
+    }
+  }
+  const seed = (db.prepare("SELECT id, model_id, dim FROM memory_rag_config WHERE id = 1").get() as {
+    id: number; model_id: string; dim: number;
+  } | undefined);
+  if (!seed) {
+    throw new Error("Schema migration 38 is incomplete: memory_rag_config seed row is missing");
+  }
+}
+
 const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
   {
     version: 3,
@@ -4511,6 +4529,51 @@ const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
       END;
     `),
     validate: validateCredentialBrokerMutationSchemaV37,
+  },
+  {
+    version: 38,
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_chunks (
+          id            TEXT PRIMARY KEY,
+          scope         TEXT NOT NULL CHECK(scope IN ('session', 'project', 'global')),
+          scope_key     TEXT NOT NULL,
+          session_id    TEXT,
+          run_id        TEXT,
+          source        TEXT NOT NULL CHECK(source IN ('session', 'experience', 'manual')),
+          content       TEXT NOT NULL CHECK(length(content) >= 1),
+          content_hash  TEXT NOT NULL UNIQUE,
+          embedding     BLOB NOT NULL,
+          dim           INTEGER NOT NULL CHECK(dim > 0),
+          metadata      TEXT,
+          created_at    TEXT NOT NULL,
+          updated_at    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_chunks_scope ON memory_chunks(scope, scope_key);
+        CREATE INDEX IF NOT EXISTS idx_memory_chunks_session ON memory_chunks(session_id);
+
+        CREATE TABLE IF NOT EXISTS memory_rag_config (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          enabled          INTEGER NOT NULL DEFAULT 0,
+          model_id         TEXT NOT NULL,
+          dim              INTEGER NOT NULL DEFAULT 384,
+          chunk_size       INTEGER NOT NULL DEFAULT 512,
+          chunk_overlap    INTEGER NOT NULL DEFAULT 64,
+          top_k            INTEGER NOT NULL DEFAULT 5,
+          min_score        REAL    NOT NULL DEFAULT 0.35,
+          max_chunks       INTEGER NOT NULL DEFAULT 50000,
+          inject_position  TEXT    NOT NULL DEFAULT 'system_prefix',
+          updated_at       TEXT NOT NULL
+        );
+      `);
+      const seed = db.prepare(`
+        INSERT INTO memory_rag_config (id, enabled, model_id, dim, chunk_size, chunk_overlap, top_k, min_score, max_chunks, inject_position, updated_at)
+        SELECT 1, 0, 'Xenova/paraphrase-multilingual-MiniLM-L12-v2', 384, 512, 64, 5, 0.35, 50000, 'system_prefix', @ts
+        WHERE NOT EXISTS (SELECT 1 FROM memory_rag_config WHERE id = 1)
+      `);
+      seed.run({ ts: nowIso() });
+    },
+    validate: validateMemoryRagSchemaV38,
   },
 ];
 

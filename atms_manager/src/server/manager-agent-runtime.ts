@@ -50,6 +50,8 @@ import {
   releasePluginAgentToolContinuationLease,
   type PluginAgentToolContinuationRecord,
 } from "../persistence/plugin-tool-continuations.js";
+import { buildMemoryInjection } from "../rag/memory-injection.js";
+import { getRagRuntime } from "../rag/runtime.js";
 
 export type ManagerAgentResponseMode = "chat" | "voice";
 
@@ -457,15 +459,42 @@ function messageWithContinuations(
   ].join("\n");
 }
 
+/**
+ * RAG injection seam: retrieve relevant long-term memory chunks for the
+ * current turn and wrap them around the user message. Degrades to the
+ * original message on any failure (model not ready, DB unavailable, RAG
+ * disabled) so the turn is never blocked by memory retrieval.
+ */
+async function messageWithMemory(
+  message: string,
+  input: RunManagerAgentTurnInput,
+): Promise<string> {
+  if (!input.session_id) return message;
+  try {
+    const { retriever } = await getRagRuntime();
+    await retriever.ensureLoaded();
+    return await buildMemoryInjection(retriever, {
+      sessionId: input.session_id,
+      projectId: input.project_id ?? undefined,
+      query: message,
+      userMessage: message,
+    });
+  } catch {
+    return message;
+  }
+}
+
 export async function runManagerAgentTurn(
   input: RunManagerAgentTurnInput,
   options?: HostShellManagerAgentOptions,
 ): Promise<RunManagerAgentTurnResult> {
   const lease = continuationLease(input);
   try {
+    const continuationMessage = messageWithContinuations(input.message, lease.records);
+    const injectedMessage = await messageWithMemory(continuationMessage, input);
     const result = await runManagerAgentTurnOnce({
       ...input,
-      message: messageWithContinuations(input.message, lease.records),
+      message: injectedMessage,
     }, options);
     if (lease.lease_id) acknowledgePluginAgentToolContinuationLease(lease.lease_id);
     return result;
@@ -500,6 +529,10 @@ export async function* runManagerAgentTurnStream(
       const outcomeContracts = turnAssets.outcome_contracts;
       assertManagerAgentOutcomeContractsResolvable(outcomeContracts);
       const toolTurnToken = pluginToolTurnToken(input, pluginContext);
+      const injectedMessage = await messageWithMemory(
+        messageWithContinuations(input.message, lease.records),
+        input,
+      );
       try {
         hostAgent = await ensureHostShellManagerAgent(input.project_id ?? undefined, options);
       } catch (err) {
@@ -513,7 +546,7 @@ export async function* runManagerAgentTurnStream(
 
       let sawResult = false;
       for await (const event of streamChatFromHostShellManagerAgent(hostAgent, hostShellTurnPayload(input, {
-        message: messageWithContinuations(input.message, lease.records),
+        message: injectedMessage,
         managerSkills,
         pluginContext,
         outcomeContracts,
@@ -569,8 +602,12 @@ export async function* runManagerAgentTurnStream(
     const outcomeContracts = turnAssets.outcome_contracts;
     assertManagerAgentOutcomeContractsResolvable(outcomeContracts);
     const toolTurnToken = pluginToolTurnToken(input, pluginContext);
+    const injectedMessage = await messageWithMemory(
+      messageWithContinuations(input.message, lease.records),
+      input,
+    );
     for await (const event of runHostCodexManagerAgentTurnStream({
-      message: messageWithContinuations(input.message, lease.records),
+      message: injectedMessage,
       project_id: input.project_id ?? undefined,
       session_id: input.session_id,
       voice_session_id: input.voice_session_id,
