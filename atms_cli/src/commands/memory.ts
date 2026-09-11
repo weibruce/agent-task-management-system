@@ -43,8 +43,7 @@ interface MemoryClearData {
 }
 
 interface MemoryResponse extends BaseResponse {
-  data?: {
-    status?: MemoryStatusData;
+  data?: MemoryStatusData & {
     query?: string;
     count?: number;
     results?: MemorySearchResult[];
@@ -92,7 +91,7 @@ export function registerMemoryCommand(program: Command): void {
       const globalOpts = program.opts<GlobalOpts>();
       const response = await getClient(globalOpts).get<MemoryResponse>("/api/memory/rag/status");
       if (globalOpts.json) output(globalOpts, response);
-      else if (response.data?.status) printStatus(response.data.status);
+      else if (response.data) printStatus(response.data as MemoryStatusData);
     });
 
   memory
