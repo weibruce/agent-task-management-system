@@ -1,0 +1,17 @@
+RAG retrieval eval report (real model, top-k=5)
+entries=14 corpus=7
+  hit@1  zh-redis-ttl  "Redis 缓存过期策略怎么选？"
+  hit@1  zh-k8s-probe  "K8s 探针怎么配置？"
+  hit@1  zh-pg-pool  "PostgreSQL 连接池怎么调优？"
+  hit@1  zh-nginx-proxy  "Nginx 反向代理健康检查如何设置？"
+  hit@1  zh-dlq  "消息队列死信怎么处理？"
+  hit@1  zh-ci-cache  "CI 缓存 key 怎么配置？"
+  hit@1  zh-docker-bridge  "Docker 容器怎么访问宿主机服务？"
+  hit@1  en-redis-ttl  "How to choose Redis cache eviction policy?"
+  hit@1  en-k8s-probe  "How to configure Kubernetes liveness probes?"
+  hit@1  en-pg-pool  "PostgreSQL connection pool tuning"
+  hit@1  en-nginx-proxy  "Nginx reverse proxy health check setup"
+  hit@1  en-dlq  "RabbitMQ dead letter queue handling"
+  hit@1  en-ci-cache  "GitHub Actions cache key configuration"
+  hit@1  en-docker-host  "How does a Docker container reach host services?"
+Recall@5=1.000 MRR=1.000

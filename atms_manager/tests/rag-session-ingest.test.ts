@@ -72,7 +72,7 @@ describe("ingestSessionMessages", () => {
         expect(row.scope_key).toBe("sess-ingest-1");
       }
     });
-  }, 120_000);
+  }, 180_000);
 
   it("is a no-op (0 ingested, no rows) when RAG is disabled", async () => {
     await withFreshHome(async () => {
@@ -121,5 +121,5 @@ describe("ingestSessionMessages", () => {
       expect(results.length).toBeGreaterThan(0);
       expect(results.some((r) => r.content.includes("0.0.0.0") || r.content.includes("127.0.0.1"))).toBe(true);
     });
-  }, 120_000);
+  }, 180_000);
 });

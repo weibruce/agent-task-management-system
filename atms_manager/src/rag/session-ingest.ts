@@ -4,19 +4,19 @@
  *
  * Runs fire-and-forget with a hard timeout so a slow model download or a
  * stuck embedding call can never hang the closeSession HTTP response.
- * All failures are swallowed: memory ingestion is best-effort and must
- * never break session lifecycle.
+ * Failures are logged and swallowed: memory ingestion is best-effort and
+ * must never break session lifecycle.
  */
 
 import { loadMessages } from "../persistence/agent-sessions.js";
 import { readRagConfig } from "./memory-retriever.js";
 import { getRagRuntime } from "./runtime.js";
 
-const INGEST_TIMEOUT_MS = 30_000;
+const INGEST_TIMEOUT_MS = 60_000;
 
 /**
  * Ingest all messages of a session into the RAG store.
- * Resolves with the number of messages ingested (0 when RAG is disabled
+ * Resolves with the number of chunks ingested (0 when RAG is disabled
  * or ingestion fails). Never throws.
  */
 export async function ingestSessionMessages(sessionId: string): Promise<number> {
@@ -44,8 +44,14 @@ export async function ingestSessionMessages(sessionId: string): Promise<number> 
       }
       return total;
     })();
-    return await Promise.race([work, timeout]);
-  } catch {
+    try {
+      return await Promise.race([work, timeout]);
+    } catch (err) {
+      console.error(`[rag] session ingest failed for ${sessionId}:`, err);
+      return total;
+    }
+  } catch (err) {
+    console.error(`[rag] session ingest failed for ${sessionId}:`, err);
     return total;
   }
 }

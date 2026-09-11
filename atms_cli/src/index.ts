@@ -21,6 +21,7 @@ import { registerPatternsCommand } from "./commands/patterns.js";
 import { registerPluginCommand } from "./commands/plugin.js";
 import { DEFAULT_MANAGER_URL } from "./local-config.js";
 import { registerCredentialCommand } from "./commands/credential.js";
+import { registerMemoryCommand } from "./commands/memory.js";
 
 export { AtmsClient } from "./client.js";
 export type { BaseResponse, AtmsClientOptions } from "./client.js";
@@ -68,6 +69,7 @@ export function createProgram(): Command {
   registerDoctorCommand(program);
   registerSmokeCommand(program);
   registerEvidenceCommands(program);
+  registerMemoryCommand(program);
 
   return program;
 }

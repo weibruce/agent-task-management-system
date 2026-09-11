@@ -1,0 +1,216 @@
+{
+  "version": 1,
+  "description": "Labeled RAG retrieval evaluation set. Each entry: a query (zh or en) plus the content(s) that should rank in the top-k. Ground truth is content-based so the same set works for both the real model and deterministic mocks.",
+  "entries": [
+    {
+      "id": "zh-redis-ttl",
+      "query": "Redis 缓存过期策略怎么选？",
+      "relevant": [
+        "Redis 缓存过期策略：TTL 固定过期时间，LRU 最近最少使用淘汰，按访问模式选择"
+      ],
+      "distractors": [
+        "Kubernetes liveness 探针与 readiness 探针的配置差异和超时设置",
+        "PostgreSQL 16 连接池 pgbouncer 参数调优与 max_client_conn 配置",
+        "Nginx 反向代理 upstream 健康检查与 keepalive 连接池配置",
+        "RabbitMQ 消息队列死信队列 dead letter exchange 的处理流程",
+        "GitHub Actions CI 缓存 setup-node 与 pnpm store 的 key 配置",
+        "Docker bridge 网络隔离配置说明：worker 容器通过 host.docker.internal 访问宿主机服务"
+      ]
+    },
+    {
+      "id": "zh-k8s-probe",
+      "query": "K8s 探针怎么配置？",
+      "relevant": [
+        "Kubernetes liveness 探针与 readiness 探针的配置差异和超时设置"
+      ],
+      "distractors": [
+        "Redis 缓存过期策略：TTL 固定过期时间，LRU 最近最少使用淘汰，按访问模式选择",
+        "PostgreSQL 16 连接池 pgbouncer 参数调优与 max_client_conn 配置",
+        "Nginx 反向代理 upstream 健康检查与 keepalive 连接池配置",
+        "RabbitMQ 消息队列死信队列 dead letter exchange 的处理流程",
+        "GitHub Actions CI 缓存 setup-node 与 pnpm store 的 key 配置",
+        "Docker bridge 网络隔离配置说明：worker 容器通过 host.docker.internal 访问宿主机服务"
+      ]
+    },
+    {
+      "id": "zh-pg-pool",
+      "query": "PostgreSQL 连接池怎么调优？",
+      "relevant": [
+        "PostgreSQL 16 连接池 pgbouncer 参数调优与 max_client_conn 配置"
+      ],
+      "distractors": [
+        "Redis 缓存过期策略：TTL 固定过期时间，LRU 最近最少使用淘汰，按访问模式选择",
+        "Kubernetes liveness 探针与 readiness 探针的配置差异和超时设置",
+        "Nginx 反向代理 upstream 健康检查与 keepalive 连接池配置",
+        "RabbitMQ 消息队列死信队列 dead letter exchange 的处理流程",
+        "GitHub Actions CI 缓存 setup-node 与 pnpm store 的 key 配置",
+        "Docker bridge 网络隔离配置说明：worker 容器通过 host.docker.internal 访问宿主机服务"
+      ]
+    },
+    {
+      "id": "zh-nginx-proxy",
+      "query": "Nginx 反向代理健康检查如何设置？",
+      "relevant": [
+        "Nginx 反向代理 upstream 健康检查与 keepalive 连接池配置"
+      ],
+      "distractors": [
+        "Redis 缓存过期策略：TTL 固定过期时间，LRU 最近最少使用淘汰，按访问模式选择",
+        "Kubernetes liveness 探针与 readiness 探针的配置差异和超时设置",
+        "PostgreSQL 16 连接池 pgbouncer 参数调优与 max_client_conn 配置",
+        "RabbitMQ 消息队列死信队列 dead letter exchange 的处理流程",
+        "GitHub Actions CI 缓存 setup-node 与 pnpm store 的 key 配置",
+        "Docker bridge 网络隔离配置说明：worker 容器通过 host.docker.internal 访问宿主机服务"
+      ]
+    },
+    {
+      "id": "zh-dlq",
+      "query": "消息队列死信怎么处理？",
+      "relevant": [
+        "RabbitMQ 消息队列死信队列 dead letter exchange 的处理流程"
+      ],
+      "distractors": [
+        "Redis 缓存过期策略：TTL 固定过期时间，LRU 最近最少使用淘汰，按访问模式选择",
+        "Kubernetes liveness 探针与 readiness 探针的配置差异和超时设置",
+        "PostgreSQL 16 连接池 pgbouncer 参数调优与 max_client_conn 配置",
+        "Nginx 反向代理 upstream 健康检查与 keepalive 连接池配置",
+        "GitHub Actions CI 缓存 setup-node 与 pnpm store 的 key 配置",
+        "Docker bridge 网络隔离配置说明：worker 容器通过 host.docker.internal 访问宿主机服务"
+      ]
+    },
+    {
+      "id": "zh-ci-cache",
+      "query": "CI 缓存 key 怎么配置？",
+      "relevant": [
+        "GitHub Actions CI 缓存 setup-node 与 pnpm store 的 key 配置"
+      ],
+      "distractors": [
+        "Redis 缓存过期策略：TTL 固定过期时间，LRU 最近最少使用淘汰，按访问模式选择",
+        "Kubernetes liveness 探针与 readiness 探针的配置差异和超时设置",
+        "PostgreSQL 16 连接池 pgbouncer 参数调优与 max_client_conn 配置",
+        "Nginx 反向代理 upstream 健康检查与 keepalive 连接池配置",
+        "RabbitMQ 消息队列死信队列 dead letter exchange 的处理流程",
+        "Docker bridge 网络隔离配置说明：worker 容器通过 host.docker.internal 访问宿主机服务"
+      ]
+    },
+    {
+      "id": "zh-docker-bridge",
+      "query": "Docker 容器怎么访问宿主机服务？",
+      "relevant": [
+        "Docker bridge 网络隔离配置说明：worker 容器通过 host.docker.internal 访问宿主机服务"
+      ],
+      "distractors": [
+        "Redis 缓存过期策略：TTL 固定过期时间，LRU 最近最少使用淘汰，按访问模式选择",
+        "Kubernetes liveness 探针与 readiness 探针的配置差异和超时设置",
+        "PostgreSQL 16 连接池 pgbouncer 参数调优与 max_client_conn 配置",
+        "Nginx 反向代理 upstream 健康检查与 keepalive 连接池配置",
+        "RabbitMQ 消息队列死信队列 dead letter exchange 的处理流程",
+        "GitHub Actions CI 缓存 setup-node 与 pnpm store 的 key 配置"
+      ]
+    },
+    {
+      "id": "en-redis-ttl",
+      "query": "How to choose Redis cache eviction policy?",
+      "relevant": [
+        "Redis 缓存过期策略：TTL 固定过期时间，LRU 最近最少使用淘汰，按访问模式选择"
+      ],
+      "distractors": [
+        "Kubernetes liveness 探针与 readiness 探针的配置差异和超时设置",
+        "PostgreSQL 16 连接池 pgbouncer 参数调优与 max_client_conn 配置",
+        "Nginx 反向代理 upstream 健康检查与 keepalive 连接池配置",
+        "RabbitMQ 消息队列死信队列 dead letter exchange 的处理流程",
+        "GitHub Actions CI 缓存 setup-node 与 pnpm store 的 key 配置",
+        "Docker bridge 网络隔离配置说明：worker 容器通过 host.docker.internal 访问宿主机服务"
+      ]
+    },
+    {
+      "id": "en-k8s-probe",
+      "query": "How to configure Kubernetes liveness probes?",
+      "relevant": [
+        "Kubernetes liveness 探针与 readiness 探针的配置差异和超时设置"
+      ],
+      "distractors": [
+        "Redis 缓存过期策略：TTL 固定过期时间，LRU 最近最少使用淘汰，按访问模式选择",
+        "PostgreSQL 16 连接池 pgbouncer 参数调优与 max_client_conn 配置",
+        "Nginx 反向代理 upstream 健康检查与 keepalive 连接池配置",
+        "RabbitMQ 消息队列死信队列 dead letter exchange 的处理流程",
+        "GitHub Actions CI 缓存 setup-node 与 pnpm store 的 key 配置",
+        "Docker bridge 网络隔离配置说明：worker 容器通过 host.docker.internal 访问宿主机服务"
+      ]
+    },
+    {
+      "id": "en-pg-pool",
+      "query": "PostgreSQL connection pool tuning",
+      "relevant": [
+        "PostgreSQL 16 连接池 pgbouncer 参数调优与 max_client_conn 配置"
+      ],
+      "distractors": [
+        "Redis 缓存过期策略：TTL 固定过期时间，LRU 最近最少使用淘汰，按访问模式选择",
+        "Kubernetes liveness 探针与 readiness 探针的配置差异和超时设置",
+        "Nginx 反向代理 upstream 健康检查与 keepalive 连接池配置",
+        "RabbitMQ 消息队列死信队列 dead letter exchange 的处理流程",
+        "GitHub Actions CI 缓存 setup-node 与 pnpm store 的 key 配置",
+        "Docker bridge 网络隔离配置说明：worker 容器通过 host.docker.internal 访问宿主机服务"
+      ]
+    },
+    {
+      "id": "en-nginx-proxy",
+      "query": "Nginx reverse proxy health check setup",
+      "relevant": [
+        "Nginx 反向代理 upstream 健康检查与 keepalive 连接池配置"
+      ],
+      "distractors": [
+        "Redis 缓存过期策略：TTL 固定过期时间，LRU 最近最少使用淘汰，按访问模式选择",
+        "Kubernetes liveness 探针与 readiness 探针的配置差异和超时设置",
+        "PostgreSQL 16 连接池 pgbouncer 参数调优与 max_client_conn 配置",
+        "RabbitMQ 消息队列死信队列 dead letter exchange 的处理流程",
+        "GitHub Actions CI 缓存 setup-node 与 pnpm store 的 key 配置",
+        "Docker bridge 网络隔离配置说明：worker 容器通过 host.docker.internal 访问宿主机服务"
+      ]
+    },
+    {
+      "id": "en-dlq",
+      "query": "RabbitMQ dead letter queue handling",
+      "relevant": [
+        "RabbitMQ 消息队列死信队列 dead letter exchange 的处理流程"
+      ],
+      "distractors": [
+        "Redis 缓存过期策略：TTL 固定过期时间，LRU 最近最少使用淘汰，按访问模式选择",
+        "Kubernetes liveness 探针与 readiness 探针的配置差异和超时设置",
+        "PostgreSQL 16 连接池 pgbouncer 参数调优与 max_client_conn 配置",
+        "Nginx 反向代理 upstream 健康检查与 keepalive 连接池配置",
+        "GitHub Actions CI 缓存 setup-node 与 pnpm store 的 key 配置",
+        "Docker bridge 网络隔离配置说明：worker 容器通过 host.docker.internal 访问宿主机服务"
+      ]
+    },
+    {
+      "id": "en-ci-cache",
+      "query": "GitHub Actions cache key configuration",
+      "relevant": [
+        "GitHub Actions CI 缓存 setup-node 与 pnpm store 的 key 配置"
+      ],
+      "distractors": [
+        "Redis 缓存过期策略：TTL 固定过期时间，LRU 最近最少使用淘汰，按访问模式选择",
+        "Kubernetes liveness 探针与 readiness 探针的配置差异和超时设置",
+        "PostgreSQL 16 连接池 pgbouncer 参数调优与 max_client_conn 配置",
+        "Nginx 反向代理 upstream 健康检查与 keepalive 连接池配置",
+        "RabbitMQ 消息队列死信队列 dead letter exchange 的处理流程",
+        "Docker bridge 网络隔离配置说明：worker 容器通过 host.docker.internal 访问宿主机服务"
+      ]
+    },
+    {
+      "id": "en-docker-host",
+      "query": "How does a Docker container reach host services?",
+      "relevant": [
+        "Docker bridge 网络隔离配置说明：worker 容器通过 host.docker.internal 访问宿主机服务"
+      ],
+      "distractors": [
+        "Redis 缓存过期策略：TTL 固定过期时间，LRU 最近最少使用淘汰，按访问模式选择",
+        "Kubernetes liveness 探针与 readiness 探针的配置差异和超时设置",
+        "PostgreSQL 16 连接池 pgbouncer 参数调优与 max_client_conn 配置",
+        "Nginx 反向代理 upstream 健康检查与 keepalive 连接池配置",
+        "RabbitMQ 消息队列死信队列 dead letter exchange 的处理流程",
+        "GitHub Actions CI 缓存 setup-node 与 pnpm store 的 key 配置"
+      ]
+    }
+  ]
+}

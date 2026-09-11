@@ -21,6 +21,7 @@ import { projectsChangesRoutesHandler } from "./projects-changes.js";
 import { gitServersRoutesHandler } from "./git-servers.js";
 import { mcpServersRoutesHandler } from "./mcp-servers.js";
 import { memoryRoutesHandler } from "./memory.js";
+import { memoryRagRoutesHandler } from "./memory-rag.js";
 import { dagWorkflowRoutesHandler } from "./dag-workflows.js";
 import { settingsBootstrapHandler } from "./settings-bootstrap.js";
 import { settingsStorageInfoHandler } from "./settings-storage-info.js";
@@ -420,6 +421,10 @@ export function createServer(
     }
 
     if (credentialRoutesHandler(req, res)) {
+      return;
+    }
+
+    if (memoryRagRoutesHandler(req, res)) {
       return;
     }
 

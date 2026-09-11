@@ -260,13 +260,38 @@ export class MemoryRetriever {
 
   /** Delete all chunks belonging to a session. Returns the number removed. */
   deleteSessionMemory(sessionId: string): number {
+    return this.deleteBy("session", sessionId);
+  }
+
+  /** Delete chunks by (scope, scopeKey). scopeKey omitted = whole scope. */
+  deleteMemory(scope: MemoryScope, scopeKey?: string): number {
+    return this.deleteBy(scope, scopeKey);
+  }
+
+  /** Delete every chunk. Returns the number removed. */
+  clearAllMemory(): number {
     const db = getDb();
-    const rows = db.prepare("SELECT id FROM memory_chunks WHERE session_id = ?").all(sessionId) as Array<{ id: string }>;
+    const rows = db.prepare("SELECT id FROM memory_chunks").all() as Array<{ id: string }>;
+    const del = db.prepare("DELETE FROM memory_chunks WHERE id = ?");
+    db.transaction(() => {
+      for (const row of rows) {
+        del.run(row.id);
+        this.index.remove(row.id);
+      }
+    })();
+    return rows.length;
+  }
+
+  private deleteBy(scope: MemoryScope, scopeKey?: string): number {
+    const db = getDb();
+    const rows = scopeKey
+      ? db.prepare("SELECT id FROM memory_chunks WHERE scope = ? AND scope_key = ?").all(scope, scopeKey) as Array<{ id: string }>
+      : db.prepare("SELECT id FROM memory_chunks WHERE scope = ?").all(scope) as Array<{ id: string }>;
     if (rows.length > 0) {
-      const stmt = db.prepare("DELETE FROM memory_chunks WHERE id = ?");
+      const del = db.prepare("DELETE FROM memory_chunks WHERE id = ?");
       db.transaction(() => {
         for (const row of rows) {
-          stmt.run(row.id);
+          del.run(row.id);
           this.index.remove(row.id);
         }
       })();

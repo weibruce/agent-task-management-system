@@ -140,6 +140,15 @@ atms patterns instantiate quorum --set workflow_id=release-quorum --set threshol
 
 For multi-round workflows that pause at durable boundaries and resume selected actors under the same run, see [Multi-Round DAGs](docs/multi-round-dags.md). For unattended Auto Fix and PR checks on a durable Linux host, see [event supervision](docs/scenarios/event-supervision.md).
 
+## Long-term memory (RAG)
+
+The Manager/Voice Agent can remember past conversations. Session content is embedded by a local multilingual model (no external API), stored in SQLite, and injected as context on each turn. RAG is off by default — see [docs/rag-memory.md](docs/rag-memory.md) for enabling, the `atms memory ...` CLI, the `/api/memory/rag/*` API, and the Recall@5 / MRR evaluation harness.
+
+```bash
+atms memory status
+atms memory search "上次那个缓存策略怎么定的？"
+```
+
 ## Agent backends
 
 Each DAG node runs one of the worker backends (selected per agent in the template, with a `*` fallback):
@@ -179,6 +188,7 @@ Key documentation:
 
 - [docs/architecture/](docs/architecture/) — durable DAG actors, deepseek-harness integration, live steering, live surface projector
 - [docs/dag-workflow-spec-v1-design.md](docs/dag-workflow-spec-v1-design.md) — WorkflowSpec v1
+- [docs/rag-memory.md](docs/rag-memory.md) — local RAG long-term memory (CLI, API, evaluation)
 - [docs/control-plane-security.md](docs/control-plane-security.md) — authenticated `wss://` for remote Nodes/Workers
 - [docs/worker-build-network.md](docs/worker-build-network.md) — mirrors and proxies for restricted networks
 - [docs/production-deployment.md](docs/production-deployment.md) — reverse proxies, public origins

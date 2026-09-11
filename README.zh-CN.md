@@ -140,6 +140,15 @@ atms patterns instantiate quorum --set workflow_id=release-quorum --set threshol
 
 关于在持久化边界暂停、并在同一次运行下恢复选定 actor 的多轮工作流，见 [Multi-Round DAGs](docs/multi-round-dags.md)。关于在持久化 Linux 主机上无人值守运行 Auto Fix 和 PR 检查，见 [事件监督](docs/scenarios/event-supervision.md)。
 
+## 长期记忆（RAG）
+
+Manager/Voice Agent 可以记住历史会话。会话内容由本地多语言模型做向量嵌入（不经过任何外部 API），存入 SQLite，并在每轮对话时注入为上下文。RAG 默认关闭 — 启用方式、`atms memory ...` CLI、`/api/memory/rag/*` API 与 Recall@5 / MRR 评估见 [docs/rag-memory.md](docs/rag-memory.md)。
+
+```bash
+atms memory status
+atms memory search "上次那个缓存策略怎么定的？"
+```
+
 ## Agent 后端
 
 每个 DAG 节点运行一个 worker 后端（在模板中按 agent 选择，带 `*` 兜底）：
@@ -179,6 +188,7 @@ npm run ci:local           # 在本地运行 Linux GitHub Actions 任务（需�
 
 - [docs/architecture/](docs/architecture/) — durable DAG actors、deepseek-harness 集成、live steering、live surface projector
 - [docs/dag-workflow-spec-v1-design.md](docs/dag-workflow-spec-v1-design.md) — WorkflowSpec v1
+- [docs/rag-memory.md](docs/rag-memory.md) — 本地 RAG 长期记忆（CLI、API、评估）
 - [docs/control-plane-security.md](docs/control-plane-security.md) — 远程 Node/Worker 的认证 `wss://`
 - [docs/worker-build-network.md](docs/worker-build-network.md) — 受限网络下的镜像源与代理
 - [docs/production-deployment.md](docs/production-deployment.md) — 反向代理与公网 Origin
