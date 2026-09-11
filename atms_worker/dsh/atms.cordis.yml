@@ -19,6 +19,19 @@
 - id: str-replace-editor
   disabled: true
 
+# Raise the one-shot terminal timeouts well above the 300s sdk-minimal
+# default. Long build/install commands (npm install, cargo build, docker
+# build) routinely exceed 5 minutes; hitting the timeout kills the DSH
+# runtime mid-turn (exit code 0) which surfaces in the UI as
+# "这次没能完成，我可以继续重试". 30 minutes matches MANAGER_AGENT_TURN_TIMEOUT_MS.
+- id: terminal-bash
+  config:
+    timeoutMs: 1800000
+
+- id: terminal-pwsh
+  config:
+    timeoutMs: 1800000
+
 - id: sessions
   config:
     root: !!js process.env.DSH_SESSION_ROOT

@@ -8,7 +8,7 @@
   "main": "./dist/index.js",
   "scripts": {
     "postinstall": "cd ../atms_protocol && npm ci",
-    "build": "tsc",
+    "build": "tsc && node -e \"const{cpSync,mkdirSync,existsSync}=require('fs');const p=require('path');const d=p.resolve('dist/dsh');if(!existsSync(d))mkdirSync(d,{recursive:true});cpSync(p.resolve('dsh/atms.cordis.yml'),p.resolve(d,'atms.cordis.yml'))\"",
     "start": "node dist/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
