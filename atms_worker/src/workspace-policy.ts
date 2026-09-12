@@ -33,7 +33,9 @@ function normalizedPolicyPath(value: string): string {
 }
 
 function includesPath(prefixes: string[], candidate: string): boolean {
-  return prefixes.some((prefix) => candidate === prefix || candidate.startsWith(`${prefix}/`));
+  return prefixes.some((prefix) =>
+    prefix === "" || candidate === prefix || candidate.startsWith(`${prefix}/`)
+  );
 }
 
 function digestFiles(files: Record<string, string>): string {

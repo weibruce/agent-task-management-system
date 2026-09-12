@@ -244,6 +244,16 @@ const CredentialBinding = Type.Object({
 }, { additionalProperties: false });
 
 const AgentRuntimeFields = {
+  agent_type: Type.Optional(Type.String({
+    minLength: 1,
+    maxLength: 128,
+    description: "Explicit agent backend type (e.g. deepseek_harness, claude-sdk, codex_appserver). Overrides the default resolution.",
+  })),
+  llm_setting_id: Type.Optional(Type.String({
+    minLength: 1,
+    maxLength: 128,
+    description: "Explicit LLM setting ID to use for this agent. Overrides the default LLM setting resolution.",
+  })),
   advisors: Type.Optional(Type.Array(AdvisorBinding, { uniqueItems: true, maxItems: 16 })),
   workspace_access: Type.Optional(WorkspaceAccess),
   builtin_tool_policy: Type.Optional(Type.Literal("backend_native", {
@@ -675,6 +685,16 @@ export const WorkflowSpecV1Schema = Type.Object({
     agents: Type.Record(Identifier, Type.Object({
       description: Type.Optional(ShortText),
       system: Type.Optional(LongText),
+      agent_type: Type.Optional(Type.String({
+        minLength: 1,
+        maxLength: 128,
+        description: "Explicit agent backend type for this agent. Overrides the default resolution.",
+      })),
+      llm_setting_id: Type.Optional(Type.String({
+        minLength: 1,
+        maxLength: 128,
+        description: "Explicit LLM setting ID for this agent. Overrides the default LLM setting resolution.",
+      })),
       skills: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 256 }), {
         uniqueItems: true,
         maxItems: 8,

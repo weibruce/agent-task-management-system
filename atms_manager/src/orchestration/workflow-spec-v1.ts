@@ -109,6 +109,8 @@ export interface CanonicalWorkflowIR {
   agents: Record<string, {
     description?: string;
     system?: string;
+    agent_type?: string;
+    llm_setting_id?: string;
     skills: string[];
     allowed_surface_views?: string[];
   }>;
@@ -1249,6 +1251,8 @@ function compileV1(workflow: WorkflowSpecV1): CanonicalWorkflowIR {
       .map(([id, agent]) => [id, {
         ...(agent.description ? { description: agent.description } : {}),
         ...(agent.system ? { system: agent.system } : {}),
+        ...(agent.agent_type ? { agent_type: agent.agent_type } : {}),
+        ...(agent.llm_setting_id ? { llm_setting_id: agent.llm_setting_id } : {}),
         skills: [...(agent.skills ?? [])].sort(),
         ...(agent.allowed_surface_views === undefined
           ? {}
@@ -1387,6 +1391,8 @@ function compileLegacy(parsed: ParsedDAG): CanonicalWorkflowIR {
       .map(([id, agent]) => [id, {
         ...(agent.description ? { description: agent.description } : {}),
         ...(agent.system ? { system: agent.system } : {}),
+        ...(agent.agent_type ? { agent_type: agent.agent_type } : {}),
+        ...(agent.llm_setting_id ? { llm_setting_id: agent.llm_setting_id } : {}),
         skills: [...(agent.skills ?? [])].sort(),
         ...(agent.allowed_surface_views === undefined
           ? {}
@@ -1735,6 +1741,8 @@ export function projectCanonicalWorkflowToParsedDAG(canonical: CanonicalWorkflow
   const agents = Object.fromEntries(Object.entries(canonical.agents).map(([id, agent]) => [id, {
     ...(agent.description ? { description: agent.description } : {}),
     ...(agent.system ? { system: agent.system } : {}),
+    ...(agent.agent_type ? { agent_type: agent.agent_type } : {}),
+    ...(agent.llm_setting_id ? { llm_setting_id: agent.llm_setting_id } : {}),
     ...(agent.skills.length > 0 ? { skills: agent.skills } : {}),
     ...(agent.allowed_surface_views === undefined
       ? {}
@@ -1989,6 +1997,8 @@ export function canonicalWorkflowToV1Document(canonical: CanonicalWorkflowIR): R
       agents: Object.fromEntries(Object.entries(canonical.agents).map(([id, agent]) => [id, {
         ...(agent.description ? { description: agent.description } : {}),
         ...(agent.system ? { system: agent.system } : {}),
+        ...(agent.agent_type ? { agent_type: agent.agent_type } : {}),
+        ...(agent.llm_setting_id ? { llm_setting_id: agent.llm_setting_id } : {}),
         ...(agent.skills.length > 0 ? { skills: agent.skills } : {}),
         ...(agent.allowed_surface_views === undefined
           ? {}
