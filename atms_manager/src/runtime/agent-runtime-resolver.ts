@@ -164,6 +164,19 @@ function agentTypeForSetting(setting: LLMSetting, input: AgentRuntimeResolutionI
     if (isKimiCodeCompatibleSetting(setting)) return managerAgentHarnessDefinition("kimi_code").agent_type;
     throw new Error(`Kimi Code ${input.surface === "manager_agent" ? "Manager Agent" : "DAG"} requires a Kimi or custom setting, got ${setting.provider_id}/${setting.model_name}`);
   }
+  // For DAG surface: when no explicit agent_type is requested and the setting
+  // uses an OpenAI-compatible or custom protocol (i.e. not Anthropic-native),
+  // default to deepseek_harness instead of claude-sdk. This makes
+  // DeepSeek V4 Flash + deepseek-harness the natural default for DAG
+  // execution with OpenAI-compatible endpoints.
+  if (
+    input.surface === "dag" &&
+    explicit === undefined &&
+    requested === DEFAULT_MANAGER_AGENT_RUNTIME_AGENT_TYPE &&
+    setting.protocol === "openai_compatible"
+  ) {
+    return managerAgentHarnessDefinition("deepseek_harness").agent_type;
+  }
   return requested;
 }
 

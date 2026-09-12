@@ -867,6 +867,17 @@ function _resolveEffectiveSetting(raw: unknown): { setting?: LLMSetting; needsSe
   let needsSecretMigration = false;
   if (isEncryptedSecret(rec.api_key_encrypted)) {
     apiKey = decryptSecret(rec.api_key_encrypted);
+    // Handle legacy double-encrypted secrets: some rows were written with
+    // encryptSecret applied twice (once for the column, once for the data blob).
+    // If the first decrypt yields another EncryptedSecret JSON, decrypt again.
+    try {
+      const inner = _jsonObject<Record<string, unknown>>(apiKey);
+      if (inner && isEncryptedSecret(inner)) {
+        apiKey = decryptSecret(inner);
+      }
+    } catch {
+      // not valid JSON; keep the first-decrypt result
+    }
   } else if (typeof rec.api_key === "string") {
     apiKey = rec.api_key;
     needsSecretMigration = true;
