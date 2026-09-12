@@ -563,6 +563,8 @@ describe("built-in DAG patterns", () => {
       max_parallelism: 4,
       worker_agent: "worker",
       context_field: "context",
+      completion: "n_of_m",
+      threshold: 3,
     });
     expect(pattern.parsed.meta.contracts?.Plan).toMatchObject({
       required: ["context", "work_items"],
@@ -586,6 +588,9 @@ describe("built-in DAG patterns", () => {
     expect(pattern.parsed.meta.agents.orchestrator?.system).toContain("exact port planned");
     expect(pattern.parsed.meta.agents.worker?.system).toContain("fan-out item");
     expect(pattern.parsed.meta.agents.worker?.system).toContain("original immutable context");
+    expect(pattern.parsed.meta.agents.worker?.system).toContain("CRITICAL");
+    expect(pattern.parsed.meta.agents.worker?.system).toContain("MUST call the handoff tool");
+    expect(pattern.parsed.meta.agents.worker?.system).toContain("NOT sufficient");
     expect(planner?.extra?.agent_runtime).toMatchObject({
       allowed_builtin_tools: [],
       allowed_dag_tools: ["handoff"],
