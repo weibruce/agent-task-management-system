@@ -176,10 +176,10 @@ function assertBuiltinToolPolicySupported(
       throw new Error("DeepSeek Harness allowed_builtin_tools must be an array");
     }
     if (!supportsDeepSeekHarnessReadTools(allowedTools)) {
-      throw new Error("DeepSeek Harness only enforces the read-only built-in tools Read, Grep, Glob, and LS");
+      throw new Error("DeepSeek Harness only enforces the Atms-managed built-in tools Read, Grep, Glob, LS, and Write");
     }
     if (allowedTools.length > 0 && (!workspaceAccess || typeof workspaceAccess !== "object" || Array.isArray(workspaceAccess))) {
-      throw new Error("DeepSeek Harness read-only built-in tools require workspace_access");
+      throw new Error("DeepSeek Harness built-in tools require workspace_access");
     }
     return;
   }

@@ -1,15 +1,19 @@
 import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
   readFileSync,
   readdirSync,
   realpathSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
 import type { AgentBuiltinToolName, DagWorkspaceAccess } from "atms-protocol";
 import type { DagToolDefinition } from "./types.js";
 
-const SUPPORTED_READ_TOOLS = new Set<string>(["Read", "Grep", "Glob", "LS"]);
+const SUPPORTED_READ_TOOLS = new Set<string>(["Read", "Grep", "Glob", "LS", "Write"]);
 const MAX_DIRECTORY_ENTRIES = 20_000;
 const MAX_GLOB_RESULTS = 1_000;
 const MAX_GREP_RESULTS = 500;
@@ -30,6 +34,7 @@ interface ReadToolOptions {
 interface PolicyRoots {
   workspace: string;
   roots: string[];
+  writableRoots: Array<{ lexical: string; resolved: () => string }>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -82,7 +87,11 @@ function policyRoots(options: ReadToolOptions): PolicyRoots {
     }
     return lexical;
   });
-  return { workspace, roots: [...new Set(roots)] };
+  const writableRoots = options.workspaceAccess.writable_paths.map((entry) => {
+    const lexical = path.resolve(workspace, entry);
+    return { lexical, resolved: () => { try { return realpathSync(lexical); } catch { return lexical; } } };
+  });
+  return { workspace, roots: [...new Set(roots)], writableRoots };
 }
 
 function stringArg(args: Record<string, unknown>, key: string, fallback?: string): string {
@@ -403,6 +412,64 @@ async function grepHandler(policy: PolicyRoots, args: Record<string, unknown>, t
   return grepInWorker(workerFiles, pattern, args.case_insensitive === true, timeoutMs);
 }
 
+function writeHandler(policy: PolicyRoots, args: Record<string, unknown>) {
+  const requested = stringArg(args, "file_path");
+  if (!safeRelativePath(requested)) {
+    throw new Error(`path must be relative and traversal-free: ${requested}`);
+  }
+  const content = args.content;
+  if (typeof content !== "string") {
+    throw new Error("content must be a string");
+  }
+  if (Buffer.byteLength(content, "utf8") > MAX_FILE_BYTES) {
+    throw new Error(`content exceeds ${MAX_FILE_BYTES} bytes`);
+  }
+  const target = path.resolve(policy.workspace, requested);
+  if (!isWithin(policy.workspace, target)) {
+    throw new Error(`path is outside the workspace: ${requested}`);
+  }
+  if (policy.writableRoots.length === 0) {
+    throw new Error("no writable_paths declared in workspace access; Write is disabled");
+  }
+  const insideWritable = policy.writableRoots.some((wr) => {
+    const resolvedRoot = wr.resolved();
+    const resolvedTarget = realpathSafe(target);
+    return isWithin(resolvedRoot, resolvedTarget);
+  });
+  if (!insideWritable) {
+    throw new Error(`path is not inside a writable root: ${requested}`);
+  }
+  // Detect symlink escapes: walk the path segments and check if any
+  // intermediate directory is a symlink whose real path leaves a writable root.
+  const segments = requested.split("/");
+  let accumulated = policy.workspace;
+  for (const segment of segments) {
+    accumulated = path.join(accumulated, segment);
+    if (existsSync(accumulated) && lstatSync(accumulated).isSymbolicLink()) {
+      const real = realpathSync(accumulated);
+      // The symlink's real path must be inside at least one writable root.
+      const insideWritableReal = policy.writableRoots.some((wr) => {
+        const resolvedRoot = wr.resolved();
+        return isWithin(resolvedRoot, real);
+      });
+      if (!insideWritableReal) {
+        throw new Error(`path resolves outside writable roots via symlink: ${requested}`);
+      }
+    }
+  }
+  mkdirSync(path.dirname(target), { recursive: true });
+  writeFileSync(target, content, "utf8");
+  return `Wrote ${Buffer.byteLength(content, "utf8")} bytes to ${requested}`;
+}
+
+function realpathSafe(target: string): string {
+  try {
+    return realpathSync(target);
+  } catch {
+    return target;
+  }
+}
+
 function schemaFor(name: AgentBuiltinToolName): Record<string, unknown> {
   const pathProperty = { type: "string", description: "Workspace-relative path inside a declared Atms root." };
   if (name === "Read") {
@@ -441,6 +508,17 @@ function schemaFor(name: AgentBuiltinToolName): Record<string, unknown> {
       },
     };
   }
+  if (name === "Write") {
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: ["file_path", "content"],
+      properties: {
+        file_path: { type: "string", description: "Workspace-relative path inside a declared writable root." },
+        content: { type: "string", description: "Full file content to write (overwrites existing file)." },
+      },
+    };
+  }
   return {
     type: "object",
     additionalProperties: false,
@@ -453,6 +531,7 @@ function descriptionFor(name: AgentBuiltinToolName): string {
   if (name === "Read") return "Read a bounded line range from one file inside the Atms-declared workspace roots.";
   if (name === "Grep") return "Search file contents inside the Atms-declared workspace roots with bounded results.";
   if (name === "Glob") return "Find files by relative glob inside one Atms-declared workspace root.";
+  if (name === "Write") return "Write file content inside a declared writable workspace root. Creates parent directories and overwrites existing files.";
   return "List one directory inside the Atms-declared workspace roots.";
 }
 
@@ -463,7 +542,7 @@ export function supportsDeepSeekHarnessReadTools(tools: readonly string[]): bool
 export function createDeepSeekHarnessReadTools(options: ReadToolOptions): DagToolDefinition[] {
   if (!supportsDeepSeekHarnessReadTools(options.allowedTools)) {
     const unsupported = options.allowedTools.filter((tool) => !SUPPORTED_READ_TOOLS.has(tool));
-    throw new Error(`DeepSeek Harness only supports Atms-managed read tools; unsupported: ${unsupported.join(", ")}`);
+    throw new Error(`DeepSeek Harness only supports Atms-managed read/write tools; unsupported: ${unsupported.join(", ")}`);
   }
   if (options.maxCalls !== undefined && (!Number.isInteger(options.maxCalls) || options.maxCalls < 1)) {
     throw new Error("built-in tool budget must be a positive integer");
@@ -494,7 +573,9 @@ export function createDeepSeekHarnessReadTools(options: ReadToolOptions): DagToo
             ? await grepHandler(policy, args, grepTimeoutMs)
             : name === "Glob"
               ? globHandler(policy, args)
-              : lsHandler(policy, args);
+              : name === "Write"
+                ? writeHandler(policy, args)
+                : lsHandler(policy, args);
         return result(text || "No results.");
       } catch (error) {
         return result(error instanceof Error ? error.message : String(error), true);

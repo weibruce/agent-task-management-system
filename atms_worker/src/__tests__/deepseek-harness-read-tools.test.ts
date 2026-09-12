@@ -125,12 +125,24 @@ describe("DeepSeek Harness Atms-managed read tools", () => {
     expect(Date.now() - startedAt).toBeLessThan(2_000);
   });
 
-  it("refuses mutating or shell built-ins", () => {
+  it("refuses shell and edit built-ins", () => {
     const workspace = fixture();
+    // Bash is not supported by DSH
     expect(() => createDeepSeekHarnessReadTools({
       workspace,
-      workspaceAccess: { writable_paths: [], readonly_paths: ["repository"] },
-      allowedTools: ["Read", "Write"],
-    })).toThrow(/only supports Atms-managed read tools/);
+      workspaceAccess: { writable_paths: ["generated"], readonly_paths: ["repository"] },
+      allowedTools: ["Read", "Bash"],
+    })).toThrow(/only supports Atms-managed read\/write tools/);
+    // Edit and MultiEdit are not supported by DSH
+    expect(() => createDeepSeekHarnessReadTools({
+      workspace,
+      workspaceAccess: { writable_paths: ["generated"], readonly_paths: ["repository"] },
+      allowedTools: ["Read", "Edit"],
+    })).toThrow(/only supports Atms-managed read\/write tools/);
+    expect(() => createDeepSeekHarnessReadTools({
+      workspace,
+      workspaceAccess: { writable_paths: ["generated"], readonly_paths: ["repository"] },
+      allowedTools: ["Read", "MultiEdit"],
+    })).toThrow(/only supports Atms-managed read\/write tools/);
   });
 });

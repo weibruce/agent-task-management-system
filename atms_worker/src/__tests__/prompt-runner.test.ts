@@ -833,11 +833,11 @@ describe("prompt runner", () => {
     }));
   });
 
-  it("limits DeepSeek Harness built-ins to Atms-managed read-only tools", async () => {
+  it("limits DeepSeek Harness built-ins to Atms-managed tools", async () => {
     for (const dagConfig of [
       makeConfigWith({
         agent_type: "deepseek_harness",
-        allowed_builtin_tools: ["Write"],
+        allowed_builtin_tools: ["Bash"],
         workspace_access: { writable_paths: ["repository"], readonly_paths: [] },
       }),
       makeConfigWith({
@@ -859,7 +859,7 @@ describe("prompt runner", () => {
       expect(sent.map((message) => JSON.parse(message))).toContainEqual(expect.objectContaining({
         type: "node_error",
         data: expect.objectContaining({
-          message: expect.stringMatching(/read-only built-in tools|require workspace_access/),
+          message: expect.stringMatching(/Atms-managed built-in tools|require workspace_access/),
         }),
       }));
     }
