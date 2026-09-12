@@ -591,7 +591,7 @@ describe("agent runtime resolver", () => {
     })).toThrow(/does not declare selectable reasoning efforts/);
   });
 
-  it("rejects DeepSeek Harness for non-Chat-Completions settings", () => {
+  it("resolves DeepSeek Harness with Anthropic-only settings (no protocol guard)", () => {
     upsertProvider({
       id: "dsh-anthropic-only",
       default_model: "anthropic-model",
@@ -607,11 +607,13 @@ describe("agent runtime resolver", () => {
       is_default: true,
     });
 
-    expect(() => resolveAgentRuntimeConfig({
+    const resolved = resolveAgentRuntimeConfig({
       surface: "manager_agent",
       settingId: setting.id,
       harness: "deepseek_harness",
-    })).toThrow(/requires an OpenAI-compatible setting/);
+    });
+    // No protocol guard: deepseek_harness resolves using chat_completions_base_url ?? base_url fallback
+    expect(resolved.agent_type).toBe("deepseek_harness");
   });
 
   it("rejects Claude SDK when only a Chat Completions endpoint is configured", () => {

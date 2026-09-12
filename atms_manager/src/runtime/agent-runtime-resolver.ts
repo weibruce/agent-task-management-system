@@ -164,18 +164,20 @@ function agentTypeForSetting(setting: LLMSetting, input: AgentRuntimeResolutionI
     if (isKimiCodeCompatibleSetting(setting)) return managerAgentHarnessDefinition("kimi_code").agent_type;
     throw new Error(`Kimi Code ${input.surface === "manager_agent" ? "Manager Agent" : "DAG"} requires a Kimi or custom setting, got ${setting.provider_id}/${setting.model_name}`);
   }
-  // For DAG surface: when no explicit agent_type is requested and the setting
-  // uses an OpenAI-compatible or custom protocol (i.e. not Anthropic-native),
-  // default to deepseek_harness instead of claude-sdk. This makes
-  // DeepSeek V4 Flash + deepseek-harness the natural default for DAG
-  // execution with OpenAI-compatible endpoints.
-  if (
-    input.surface === "dag" &&
-    explicit === undefined &&
-    requested === DEFAULT_MANAGER_AGENT_RUNTIME_AGENT_TYPE &&
-    setting.protocol === "openai_compatible"
-  ) {
-    return managerAgentHarnessDefinition("deepseek_harness").agent_type;
+  // For DAG surface: when no explicit agent_type is requested, check the
+  // ATMS_DAG_DEFAULT_AGENT_TYPE env var first, then fall back to the
+  // openai_compatible protocol auto-detection.
+  if (input.surface === "dag" && explicit === undefined) {
+    const envDefault = process.env.ATMS_DAG_DEFAULT_AGENT_TYPE?.trim();
+    if (envDefault) {
+      return envDefault;
+    }
+    if (
+      requested === DEFAULT_MANAGER_AGENT_RUNTIME_AGENT_TYPE &&
+      setting.protocol === "openai_compatible"
+    ) {
+      return managerAgentHarnessDefinition("deepseek_harness").agent_type;
+    }
   }
   return requested;
 }
@@ -185,7 +187,7 @@ function baseUrlForSetting(setting: LLMSetting, agentType: string): string | und
   if (agentType === "codex_appserver") return resolveCodexResponsesBaseUrlForSetting(setting);
   if (agentType === "kimi_code") return setting.base_url ?? setting.chat_completions_base_url;
   if (agentType === "deepseek_harness") {
-    return resolveDeepSeekHarnessBaseUrlForSetting(setting);
+    return resolveDeepSeekHarnessBaseUrlForSetting(setting) ?? setting.chat_completions_base_url ?? setting.base_url;
   }
   return setting.base_url ?? setting.chat_completions_base_url;
 }
@@ -218,9 +220,6 @@ export function resolveAgentRuntimeConfig(input: AgentRuntimeResolutionInput): A
 
   const setting = settingForInput(input);
   const agentType = agentTypeForSetting(setting, input);
-  if (agentType === "deepseek_harness" && setting.protocol !== "openai_compatible") {
-    throw new Error(`DeepSeek Harness requires an OpenAI-compatible setting, got ${setting.provider_id}/${setting.model_name} (${setting.protocol})`);
-  }
   const baseUrl = baseUrlForSetting(setting, agentType);
   const requestedModel = input.modelName
     ? canonicalModelNameForEndpoint(setting.provider_id, setting.endpoint_id, input.modelName)
