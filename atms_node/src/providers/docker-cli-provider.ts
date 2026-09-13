@@ -323,7 +323,7 @@ export class DockerCliProvider implements ExecutionProvider {
   private readonly dockerPath: string;
 
   constructor(options: DockerCliProviderOptions = {}) {
-    this.dockerPath = resolveDockerCliPath(options);
+    this.dockerPath = resolveDockerCliPath({ ...options, env: process.env });
   }
 
   async create(config: ContainerConfig): Promise<ContainerInfo> {

@@ -1,5 +1,5 @@
 import type { ExecutionProvider, ContainerConfig, ContainerInfo } from "../providers/types.js";
-import { lstatSync } from "node:fs";
+import { lstatSync, mkdirSync } from "node:fs";
 import { validateMounts, allowedMounts, workerAllowedMounts } from "../storage/mount-policy.js";
 import type { MountPolicyOptions } from "../storage/mount-policy.js";
 
@@ -90,6 +90,20 @@ export async function createWorkerContainer(opts: CreateWorkerOptions): Promise<
   for (const dm of defaultMounts) {
     if (!mounts.some((m) => m.container === dm.container)) {
       mounts.push({ host: dm.host, container: dm.container, mode: dm.mode });
+    }
+  }
+
+  // Ensure writable subpath directories exist on the host before Docker
+  // attempts to bind-mount them. Docker requires the source path to exist.
+  if (workspaceWritableSubpath) {
+    const subpathMount = mounts.find((m) => m.container === `/workspace/${workspaceWritableSubpath}`);
+    if (subpathMount) {
+      try {
+        mkdirSync(subpathMount.host, { recursive: true, mode: 0o700 });
+      } catch {
+        // Directory creation is best-effort; the mount will fail with a
+        // clear Docker error if the path is truly unusable.
+      }
     }
   }
 
