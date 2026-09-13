@@ -599,6 +599,15 @@ describe("built-in DAG patterns", () => {
       allowed_builtin_tools: [],
       allowed_dag_tools: ["handoff"],
     });
+    // Worker policy must grant workers enough access to actually execute tasks
+    const workerPolicy = fanout?.gateway_config?.worker_policy as Record<string, unknown> | undefined;
+    expect(workerPolicy).toBeDefined();
+    expect(workerPolicy?.allowed_builtin_tools).toEqual(
+      expect.arrayContaining(["Read", "Grep", "Glob", "LS", "Write"]),
+    );
+    expect(workerPolicy?.allowed_dag_tools).toEqual(["handoff"]);
+    const wsAccess = workerPolicy?.workspace_access as { writable_paths: string[] } | undefined;
+    expect(wsAccess?.writable_paths).toContain("output");
   });
 
   it("keeps compost proposals behind a durable human approval node", () => {

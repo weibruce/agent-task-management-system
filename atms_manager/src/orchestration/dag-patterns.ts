@@ -274,7 +274,7 @@ const orchestratorWorkers: DAGPatternDefinition = {
           kind: "fanout",
           inputs: { plan: { contract: "Plan" } },
           outputs: { passed: {}, failed: {} },
-          config: { input: "plan", item_field: "work_items", context_field: "context", worker_agent: "worker", max_items: "{{max_workers}}", max_parallelism: "{{max_parallelism}}", completion: "n_of_m", threshold: 3, result_contract: "WorkerResult", success_field: "status", success_values: ["success"], result_port: "passed", failed_port: "failed", cancel_remaining: false },
+          config: { input: "plan", item_field: "work_items", context_field: "context", worker_agent: "worker", max_items: "{{max_workers}}", max_parallelism: "{{max_parallelism}}", completion: "n_of_m", threshold: 3, worker_policy: { allowed_builtin_tools: ["Read", "Grep", "Glob", "LS", "Write"], allowed_dag_tools: ["handoff"], workspace_access: { writable_paths: ["output"], readonly_paths: ["input"] } }, result_contract: "WorkerResult", success_field: "status", success_values: ["success"], result_port: "passed", failed_port: "failed", cancel_remaining: false },
         },
         verify: { kind: "agent", agent: "verifier", allowed_builtin_tools: [], allowed_dag_tools: ["handoff"], inputs: { aggregate: {} }, outputs: { verified: {}, failed: {} } },
         done: { kind: "terminal", outcome: "success", inputs: { result: {} } },
