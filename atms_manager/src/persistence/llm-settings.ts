@@ -1562,7 +1562,11 @@ export function findActiveCodexCompatibleSetting(): LLMSetting | undefined {
 }
 
 export function resolveDeepSeekHarnessBaseUrlForSetting(setting: LLMSetting): string | undefined {
-  if (setting.protocol !== "openai_compatible") return undefined;
+  // Accept openai_compatible, custom, and null protocols. Custom DeepSeek
+  // settings created via the UI often have protocol=null or "custom" rather
+  // than the strict "openai_compatible" tag. The DSH harness itself uses the
+  // OpenAI Chat Completions API regardless of the protocol label.
+  if (setting.protocol === "anthropic_compatible") return undefined;
   return setting.chat_completions_base_url ?? setting.base_url;
 }
 

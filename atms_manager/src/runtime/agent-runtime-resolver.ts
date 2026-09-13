@@ -119,25 +119,62 @@ function findActiveKimiSetting(modelName?: string): LLMSetting | undefined {
 
 function settingForInput(input: AgentRuntimeResolutionInput): LLMSetting {
   const label = input.surface === "manager_agent" ? "Manager" : "DAG";
-  const requested = requestedAgentType(input);
+  const explicit = requestedAgentType(input);
+  const requested = explicit ?? DEFAULT_MANAGER_AGENT_RUNTIME_AGENT_TYPE;
+  // When the env var forces a specific agent_type, use the corresponding
+  // compatible setting finder so the LLM setting matches the harness.
+  // Also detect the openai_compatible → deepseek_harness auto-detection
+  // (same logic as agentTypeForSetting) so the setting finder matches.
+  const envForcedDagHarness = input.surface === "dag" && explicit === undefined
+    ? process.env.ATMS_DAG_DEFAULT_AGENT_TYPE?.trim() ?? undefined
+    : undefined;
+  const effectivelyRequested = envForcedDagHarness ?? requested;
   const directlyRequestedSetting = input.providerName
     ? findActiveSetting(input.providerName, input.modelName)
     : undefined;
-  const setting = input.settingId
+  let setting = input.settingId
     ? getSetting(input.settingId)
     : input.providerName
     ? directlyRequestedSetting ?? (isKimiProviderId(input.providerName) ? findActiveKimiSetting(input.modelName) : undefined)
-    : requested === "kimi_code"
+    : effectivelyRequested === "kimi_code"
     ? findActiveKimiSetting(input.modelName)
-    : requested === "codex_appserver"
+    : effectivelyRequested === "codex_appserver"
     ? findActiveCodexCompatibleSetting()
-    : requested === "deepseek_harness"
+    : effectivelyRequested === "deepseek_harness"
     ? findActiveDeepSeekHarnessCompatibleSetting()
-    : input.surface === "manager_agent" || requested === "claude-sdk"
+    : input.surface === "manager_agent" || effectivelyRequested === "claude-sdk"
     ? findActiveClaudeSdkCompatibleSetting()
     : input.surface === "dag"
     ? findActiveLlmRuntimeSetting()
     : undefined;
+  // When no explicit setting was requested and the initial finder returned
+  // undefined, retry with the default LLM runtime setting and let
+  // agentTypeForSetting decide the agent_type based on the protocol.
+  // This handles the openai_compatible → deepseek_harness auto-detection
+  // for DAG surface (matching agentTypeForSetting's logic).
+  if (
+    !setting &&
+    input.settingId === undefined &&
+    input.providerName === undefined &&
+    input.surface === "dag" &&
+    explicit === undefined
+  ) {
+    const defaultSetting = findActiveLlmRuntimeSetting();
+    if (defaultSetting) {
+      setting = defaultSetting;
+      const envDefault = envForcedDagHarness;
+      const detectedAgentType = envDefault
+        ?? (defaultSetting.protocol === "openai_compatible"
+          ? managerAgentHarnessDefinition("deepseek_harness").agent_type
+          : undefined);
+      if (detectedAgentType === "deepseek_harness" && setting) {
+        // The detected agent type is deepseek_harness — use the compatible
+        // setting finder to get the best match.
+        const dshSetting = findActiveDeepSeekHarnessCompatibleSetting();
+        if (dshSetting) setting = dshSetting;
+      }
+    }
+  }
   if (!setting) {
     throw new Error(input.settingId
       ? `Active ${label} LLM setting not found: ${input.settingId}`
@@ -294,6 +331,8 @@ export function resolveAgentRuntimeConfig(input: AgentRuntimeResolutionInput): A
       ? "anthropic_compatible"
       : agentType === "codex_appserver"
       ? CODEX_RESPONSES_PROTOCOL
+      : agentType === "deepseek_harness"
+      ? "openai_compatible"
       : setting.protocol,
     anthropic_auth_mode: agentType === "claude-sdk"
       ? resolveClaudeSdkAuthModeForSetting(setting)
