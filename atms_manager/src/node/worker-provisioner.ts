@@ -12,6 +12,7 @@ import {
   sendWorkerRemoveRequest,
   type LifecycleResult,
 } from "./lifecycle-request.js";
+import { resolveDockerBin } from "./docker-bin.js";
 import type { DagWorkspaceInputProjection } from "atms-protocol";
 
 /* -------------------------------------------------------------------------- */
@@ -229,7 +230,7 @@ export async function deprovisionWorkerContainer(
   if (options?.verifyDockerCleanup && options.labelKey && options.labelValue) {
     try {
       const { spawnSync } = await import("node:child_process");
-      const result = spawnSync("docker", [
+      const result = spawnSync(resolveDockerBin(), [
         "ps", "-a", "--filter", `label=${options.labelKey}=${options.labelValue}`, "-q",
       ], { encoding: "utf-8", timeout: 10_000, windowsHide: true });
       dockerCleanupVerified = (result.stdout ?? "").trim() === "";

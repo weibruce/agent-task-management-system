@@ -1,5 +1,6 @@
 import { execFile as execFileCb, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { resolveDockerBin } from "../docker-bin.js";
 import type {
   ExecutionProvider,
   ContainerConfig,
@@ -84,7 +85,9 @@ export function resolveDockerCliPath(options: DockerCliProviderOptions = {}): st
     const found = windowsDockerBinaryCandidates(env).find((candidate) => exists(candidate));
     if (found) return found;
   }
-  return "docker";
+  // Never fall back to a bare PATH lookup: a `docker` wrapper script that
+  // re-invokes itself forks processes until the host runs out of memory.
+  return resolveDockerBin(env, platform);
 }
 
 function execFile(
@@ -323,7 +326,9 @@ export class DockerCliProvider implements ExecutionProvider {
   private readonly dockerPath: string;
 
   constructor(options: DockerCliProviderOptions = {}) {
-    this.dockerPath = resolveDockerCliPath({ ...options, env: process.env });
+    // Honor an injected env so callers (and tests) get deterministic binary
+    // resolution instead of always inheriting the ambient PATH.
+    this.dockerPath = resolveDockerCliPath({ ...options, env: options.env ?? process.env });
   }
 
   async create(config: ContainerConfig): Promise<ContainerInfo> {

@@ -15,6 +15,7 @@ import {
 } from "atms-protocol";
 import { getAtmsHome } from "../config/env.js";
 import { emit } from "../events/bus.js";
+import { resolveDockerBin } from "../node/docker-bin.js";
 import { getAllWorkers } from "../worker/registry.js";
 import { dagResourceStatusPath } from "./dag-resource-status.js";
 import {
@@ -208,8 +209,11 @@ function defaultCommandRunner(
   args: string[],
   options: { cwd?: string; timeoutMs?: number },
 ): Promise<CommandResult> {
+  // Never fall back to a bare PATH lookup: a `docker` wrapper script that
+  // re-invokes itself forks processes until the host runs out of memory.
+  const resolvedCommand = command === "docker" ? resolveDockerBin() : command;
   return new Promise((resolve, reject) => {
-    execFile(command, args, {
+    execFile(resolvedCommand, args, {
       cwd: options.cwd,
       encoding: "utf8",
       env: { ...process.env, LANG: "C", LC_ALL: "C" },
@@ -913,7 +917,8 @@ export class DagEnvironmentController {
 
     let child: ReturnType<typeof spawn>;
     try {
-      child = this.spawnImpl("docker", args, {
+      const dockerBin = resolveDockerBin(this.env);
+      child = this.spawnImpl(dockerBin, args, {
         cwd: this.repoRoot,
         env: {
           ...this.env,
