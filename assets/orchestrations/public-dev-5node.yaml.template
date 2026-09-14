@@ -87,6 +87,9 @@ agents:
       Use the handoff tool exactly once on port "done".
       The handoff content must be non-empty and must include final status, artifact paths, and whether the DAG smoke passed.
 
+limits:
+  max_parallelism: 10
+
 nodes:
   plan:
     name: Plan

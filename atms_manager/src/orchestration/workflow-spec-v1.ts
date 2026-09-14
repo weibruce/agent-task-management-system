@@ -1269,7 +1269,7 @@ function compileV1(workflow: WorkflowSpecV1): CanonicalWorkflowIR {
     policies: {
       max_nodes: workflow.spec.policies?.max_nodes ?? 1000,
       max_edges: workflow.spec.policies?.max_edges ?? 10_000,
-      max_parallelism: workflow.spec.policies?.max_parallelism ?? 32,
+      max_parallelism: workflow.spec.policies?.max_parallelism ?? 10,
       max_dispatches: workflow.spec.policies?.max_dispatches ?? 30,
       max_handoffs: workflow.spec.policies?.max_handoffs ?? 50,
       max_corrections_per_node: workflow.spec.policies?.max_corrections_per_node ?? 2,
@@ -1409,7 +1409,7 @@ function compileLegacy(parsed: ParsedDAG): CanonicalWorkflowIR {
     policies: {
       max_nodes: 1000,
       max_edges: 10_000,
-      max_parallelism: 32,
+      max_parallelism: 10,
       max_dispatches: 30,
       max_handoffs: 50,
       max_corrections_per_node: 2,
@@ -2015,7 +2015,7 @@ export function canonicalWorkflowToV1Document(canonical: CanonicalWorkflowIR): R
 function _isDefaultPolicies(policies: CanonicalWorkflowIR["policies"]): boolean {
   return policies.max_nodes === 1000 &&
     policies.max_edges === 10_000 &&
-    policies.max_parallelism === 32 &&
+    policies.max_parallelism === 10 &&
     policies.max_dispatches === 30 &&
     policies.max_handoffs === 50 &&
     policies.max_corrections_per_node === 2 &&

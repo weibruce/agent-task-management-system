@@ -1440,7 +1440,7 @@ spec:
   policies:
     max_nodes: 48
     max_edges: 80
-    max_parallelism: 4
+    max_parallelism: 10
     max_dispatches: 64
     max_handoffs: 80
     max_corrections_per_node: 4

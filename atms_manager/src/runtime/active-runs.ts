@@ -404,7 +404,7 @@ const store = new Map<string, ActiveRun>();
 
 const DEFAULT_LIMITS: DAGRunLimits = {
   max_nodes: 1000,
-  max_parallelism: 32,
+  max_parallelism: 10,
   max_dispatches: 30,
   max_handoffs: 50,
   max_corrections_per_node: 2,
