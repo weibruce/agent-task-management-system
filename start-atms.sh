@@ -14,4 +14,7 @@ export ATMS_DAG_WORKER_IDLE_TTL_MS=60000
 
 # 使用系统（rootful）Docker：bruce 已在 docker 组，直连 /var/run/docker.sock 即可，
 # 不需要 sg docker 包装脚本（那个包装脚本会自我递归 fork，见 resolveDockerBin 的修复）。
-atms start --host 0.0.0.0 --ui --enable-text-mode
+#
+# 不要加 --enable-text-mode：Agent UI 文本模式是临时调试壳，默认关闭时 /agent
+# 直接进 Voice Agent cockpit（语音座舱）。需要文本壳时临时加回该 flag。
+atms start --host 0.0.0.0 --ui
