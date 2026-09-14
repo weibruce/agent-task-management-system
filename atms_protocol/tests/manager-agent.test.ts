@@ -808,6 +808,32 @@ describe("Manager Agent harness contract", () => {
     expect(removed).toEqual(["written"]);
   });
 
+  it("requires user-facing replies to follow the user's language", () => {
+    const chatPrompt = buildManagerAgentSystemPrompt({
+      responseMode: "chat",
+      runtime: {
+        placement: "host_shell",
+        provider: "deepseek",
+        model: "deepseek-v4-flash",
+        harness: "deepseek_harness",
+      },
+    });
+    expect(chatPrompt).toContain("same language as the user's most recent message");
+    expect(chatPrompt).toContain("Never open in English and then continue in the user's language");
+
+    const voicePrompt = buildManagerAgentSystemPrompt({
+      responseMode: "voice",
+      runtime: {
+        placement: "host_shell",
+        provider: "deepseek",
+        model: "deepseek-v4-flash",
+        harness: "deepseek_harness",
+      },
+    });
+    expect(voicePrompt).toContain("same language as the user's most recent message");
+    expect(voicePrompt).toContain("Chinese when the user speaks Chinese");
+  });
+
   it("builds one voice prompt contract for host harnesses", () => {
     const prompt = buildManagerAgentSystemPrompt({
       responseMode: "voice",
